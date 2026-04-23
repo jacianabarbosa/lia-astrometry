@@ -1,4 +1,4 @@
-# asteroid-hunter v1.2
+# asteroid-hunter v1.3
 
 Pipeline Python de pré-triagem de asteroides em imagens FITS do IASC/Pan-STARRS.
 
