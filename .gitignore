@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+env/
+.venv/
+
+# Dados astronômicos (não versionar imagens FITS brutas)
+imagens/*.fits
+imagens/*.fit
+imagens/*.fts
+
+# Resultados gerados (opcional — comente se quiser versionar)
+resultados/*.png
+resultados/*.txt
+resultados/*.json
+resultados/*.log
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Distribuição
+dist/
+build/
+*.egg-info/
+
+# Pytest
+.pytest_cache/

@@ -1,0 +1,7 @@
+astropy>=6.0.0
+photutils>=1.13.0
+astroquery>=0.4.7
+numpy>=1.26.0
+scipy>=1.13.0
+matplotlib>=3.9.0
+pytest>=8.0.0
