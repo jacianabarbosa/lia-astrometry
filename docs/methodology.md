@@ -1,0 +1,147 @@
+[Leia em Português do Brasil](methodology.pt-BR.md)
+
+# Lia Methodology
+
+**Version:** 1.5.0  
+**Repository:** `lia-astrometry`  
+**Author:** Jaciana Barbosa
+
+Lia is a pre-screening pipeline for moving-object candidates in IASC/Pan-STARRS FITS image sequences. It is designed to reduce manual inspection effort before Astrometrica review. It does not replace Astrometrica, MPC validation, or the official IASC workflow.
+
+## Pipeline Steps
+
+1. **FITS loading**  
+   Lia reads the science HDU from each FITS file and converts image data to `float64`. This avoids premature precision loss during background subtraction, PSF fitting, centroid refinement, and WCS conversion.
+
+2. **Metadata extraction**  
+   The pipeline reads WCS keywords, image dimensions, exposure time, and timing metadata. `DATE-OBS` is preferred when available; `MJD-OBS` is accepted as a fallback.
+
+3. **Timestamp and MJD handling**  
+   For moving-object astrometry, the scientifically relevant timestamp is the middle of the exposure. Lia stores both start and mid-exposure times as JD and MJD. The mid-exposure time is used for downstream astrometric reporting.
+
+4. **Local background estimation**  
+   The background is estimated with `photutils.Background2D` using a local mesh and median filtering. This is more robust than a single global threshold in fields with gradients, bright-star halos, detector structure, or masked pixels.
+
+5. **Source detection**  
+   Sources are detected on the background-subtracted, local-SNR image with `DAOStarFinder`. Saturated, invalid, and non-finite pixels are masked before detection.
+
+6. **PSF and sub-pixel centroid refinement**  
+   Each source seed is refined using a Moffat2D PSF model. A Gaussian2D model is used as fallback when the Moffat fit fails. The fitted FWHM is used to reject sources that are too narrow for atmospheric seeing, too broad for a point source, or likely to be blends, artifacts, or cosmic-ray-like detections.
+
+7. **Gaia DR3 astrometric refinement**  
+   In `--wcs-mode gaia`, Lia queries Gaia DR3 around the initial WCS center, propagates proper motions to the observation epoch, performs a broad translation match, then performs a fine cross-match and optional affine WCS update. The JSON records Gaia status, RMS residuals, offsets, and match counts for each frame.
+
+8. **Header-only WCS fallback**  
+   In `--wcs-mode header`, Gaia refinement is skipped and the constructed header WCS is used directly. The rest of the pipeline is unchanged. This mode exists for controlled internal comparisons, not as a separate workflow for IASC submission.
+
+9. **Track construction**  
+   Detected sources are projected into a local tangent-plane representation and linked across the four frames using reciprocal nearest-neighbor matching. A candidate track must be present across all four frames.
+
+10. **Kinematic validation**  
+    Lia fits a linear trajectory to the four measured positions and records the mean residual and `R^2`. Short IASC sequences are expected to show approximately linear motion; irregular residuals are evidence of artifacts, blends, or incorrect linking.
+
+11. **False-positive rejection**  
+    Candidates are rejected or penalized using edge distance, SNR, FWHM, elongation, point-source morphology, flux variation, hot-pixel heuristics, and Gaia static-source checks.
+
+12. **Heuristic scoring**  
+    The score combines linearity, velocity consistency, photometric stability, morphology, morphology consistency, elongation, and velocity range. It is a triage score, not a calibrated statistical confidence value.
+
+13. **SkyBot/MPC neighborhood check**  
+    When enabled, Lia queries SkyBot/IMCCE around candidate coordinates and the observation epoch to identify nearby known Solar System objects. A SkyBot match is contextual information, not final validation.
+
+14. **Output generation**  
+    Lia writes JSON, text, draft MPC-style text, PNG cutouts, and logs. The JSON includes `run_metadata`, `global_metrics`, candidate-level traceability, manual-validation placeholders, and both Gaia and header-mode provenance.
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| FITS | Flexible Image Transport System, the standard astronomical image format used by IASC/Pan-STARRS sets. |
+| IASC | International Astronomical Search Collaboration, the campaign workflow in which participants inspect FITS image sets and submit validated measurements through the official process. |
+| Astrometrica | The software used in the IASC workflow for visual inspection, astrometric measurement, photometric calibration, and report preparation. |
+| MPC report | A Minor Planet Center observation report. Lia can generate draft auxiliary text, but official reporting should be reviewed or produced in Astrometrica. |
+| WCS | World Coordinate System, the transformation between pixel coordinates and sky coordinates. |
+| Gaia DR3 | The third Gaia data release, used here as an astrometric reference catalog. |
+| WCS residuals | Differences between Gaia reference-star positions and positions predicted by the fitted WCS, usually summarized as RMS in arcseconds. |
+| Background2D | A local background model from `photutils` that estimates sky background over a mesh rather than assuming a flat field. |
+| PSF fitting | Fitting an analytic point-spread function, such as Moffat or Gaussian, to estimate a sub-pixel centroid and source width. |
+| Centroid | The estimated center of a detected source in pixel coordinates. Lia preserves sub-pixel values internally. |
+| MJD / mid-exposure time | Modified Julian Date at the midpoint of an exposure. Moving-object positions should be associated with mid-exposure time. |
+| SkyBot | IMCCE service for known Solar System object lookup at a given time and position. |
+| Moving-object candidate | A source track that appears to move coherently across the four frames and requires human validation. |
+| Heuristic triage score | A transparent ranking score based on physical and instrumental criteria. It is not a calibrated statistical confidence value. |
+
+## Methodological Justification
+
+Local background estimation reduces false positives in non-uniform images because a source is judged against the noise and sky level near its own position rather than against a global statistic. This matters in Pan-STARRS fields where halos, detector structure, and masked pixels can change the local detection threshold.
+
+PSF-based sub-pixel centroiding improves preliminary positions by fitting a continuous source model to the local light distribution. The same fit gives an FWHM estimate, which helps distinguish point-like astronomical sources from hot pixels, cosmic rays, saturated artifacts, trails, and blends.
+
+Gaia DR3 refinement reduces systematic WCS offsets when enough clean stellar references are available. Lia records the number of matches and RMS residuals so that every refined frame can be audited. If Gaia fails or does not improve the field, Lia preserves a documented fallback to the header WCS.
+
+Kinematic validation is necessary because IASC sequences are short. A real Solar System object should show nearly linear motion over four frames, while noise peaks, mismatched stars, and edge artifacts often produce inconsistent steps or poor linear residuals.
+
+Human-in-the-loop validation remains necessary. Lia cannot determine an orbit, cannot calibrate final photometry, and cannot replace the judgement required to inspect blends, low-SNR sources, and known failure modes in Astrometrica.
+
+## Data Integrity
+
+Lia converts FITS image arrays to `float64` at load time and keeps sub-pixel source coordinates as floating-point values through background subtraction, PSF fitting, track construction, WCS conversion, and JSON export. Rounding is reserved for human-readable logs, reports, and final serialized display fields.
+
+Invalid pixels are masked before background estimation and source detection. The mask covers saturated pixels, near-zero invalid pixels, and non-finite values. This prevents saturated regions from inflating local background RMS and prevents invalid pixels from becoming artificial detections.
+
+## Gaia Vs Header-Only Evaluation
+
+The main operational mode is:
+
+```bash
+python src/detector.py --wcs-mode gaia
+```
+
+The internal comparison mode is:
+
+```bash
+python src/detector.py --wcs-mode header
+```
+
+The header mode disables only Gaia DR3 refinement. Background estimation, PSF fitting, detection threshold, tracking, scoring, filters, and outputs remain identical. This supports a controlled comparison of candidate recovery, ranking changes, RA/Dec differences, angular separation from Astrometrica measurements, Gaia RMS, and match counts.
+
+Only the final Astrometrica-generated report should be submitted to IASC. The Gaia/header comparison is an internal validation study.
+
+## Validation Plan
+
+### Operational Evaluation
+
+```text
+IASC FITS set
+-> Lia with Gaia DR3
+-> prioritized candidate list
+-> manual inspection in Astrometrica
+-> Astrometrica MPC report
+-> IASC submission
+-> IASC operational feedback, when available
+```
+
+Metrics to collect:
+
+- reduction in candidate search space;
+- top-1/top-3/top-5 usefulness;
+- candidates measurable in Astrometrica;
+- candidates included in an Astrometrica MPC report;
+- IASC feedback when available;
+- false positives and failure modes.
+
+### Internal Gaia Comparison
+
+Run each set with `--wcs-mode gaia` and `--wcs-mode header`, then export both JSON outputs through `tools/export_metrics.py`. Compare ranking changes, Gaia RMS, match counts, coordinate differences, and angular separation from Astrometrica measurements.
+
+## Limitations
+
+- Lia does not replace Astrometrica.
+- The score is heuristic, not a calibrated statistical confidence value.
+- Gaia DR3 may fail or may not improve all fields.
+- Header WCS may already be sufficient in some cases.
+- PSF fitting can fail for low-SNR, blended, saturated, trailed, or edge sources.
+- `Background2D` parameters require empirical validation across IASC practice and campaign sets.
+- False-positive rejection can reject real candidates under degraded conditions.
+- IASC feedback is operational validation, not universal ground truth.
+- Lia does not implement orbit determination, digest2 scoring, shift-and-stack, CNN classification, GUI workflows, or automatic MPC/IASC submission.

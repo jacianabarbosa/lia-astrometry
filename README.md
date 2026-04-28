@@ -1,500 +1,274 @@
-# TRITON — Tracking and Robust Identification of Transient Objects in the Night
+[Leia em Português do Brasil](README.pt-BR.md)
 
-**Pipeline científico de pré-triagem de asteroides em imagens FITS do IASC/Pan-STARRS**
+# Lia
 
-**Rastreamento e Identificação Robusta de Objetos Transientes na Noite**
+**Lia** is a Python pipeline for pre-screening moving-object candidates in IASC FITS image sequences, with Gaia DR3 astrometric refinement and support for manual validation in Astrometrica.
 
-**Autora:** Jaciana Barbosa — Cientista da Computação & Astrônoma Amadora  
-Icapuí, Ceará, Brasil  
-Participante do IASC (International Astronomical Search Collaboration)
+Lia does not replace Astrometrica, MPC validation, or the official IASC workflow. It is designed as a pre-screening and prioritization layer to reduce manual inspection effort and generate auditable outputs for subsequent human validation.
 
-> *TRITON foi criado para rastrear pontos fracos e transitórios no céu noturno. Em uma sequência FITS, a maior parte do campo é estática; o objeto de interesse é pequeno, discreto e aparece pelo movimento coerente entre frames.*
+> The name **Lia** is used as a project name and personal dedication by the author. It is not an acronym.
 
----
+**Author:** Jaciana Barbosa
+**Repository:** `lia-astrometry`
+**Version:** `v1.5.0`
+**License:** MIT
 
-## Sumário
+## Overview
 
-- [Problema e Solução](#problema-e-solução)
-- [Diferenciais Técnicos](#diferenciais-técnicos)
-- [Workflow](#workflow)
-- [Como Funciona](#como-funciona)
-- [Instalação](#instalação)
-- [Uso](#uso)
-- [Outputs Gerados](#outputs-gerados)
-- [Score e Flags](#score-e-flags)
-- [Limitações](#limitações)
-- [Estrutura do Projeto](#estrutura-do-projeto)
-- [Referências](#referências)
-- [Licença](#licença)
+IASC/Pan-STARRS practice and campaign sets usually contain four FITS frames of the same field. The scientific task is to find sources that move coherently while most stars and galaxies remain fixed. Lia automates the first screening step: it detects point-like sources, builds candidate tracks, rejects obvious artifacts, ranks the remaining candidates, and writes outputs that can be reviewed manually in Astrometrica.
 
----
+The output is intentionally conservative. A high-ranked candidate is not a confirmed asteroid discovery. It is a candidate worth measuring or rejecting in the normal Astrometrica workflow.
 
-## Problema e Solução
+## Positioning
 
-O IASC (International Astronomical Search Collaboration) é um programa internacional de ciência cidadã, realizado em parceria com a NASA, em que estudantes, professores e astrônomos amadores analisam imagens reais de telescópios profissionais para identificar e medir asteroides. No fluxo usado aqui, as imagens vêm do Pan-STARRS, no Observatório Haleakalā, em Maui - Havaí.
+Lia is a pre-screening pipeline. It prioritizes candidates; it does not confirm discoveries, submit observations, or replace the final measurement process.
 
-O IASC distribui conjuntos com sequências de quatro imagens FITS do mesmo campo para que participantes identifiquem asteroides visualmente. Cada imagem contém muitas fontes pontuais. Um asteroide é um ponto que se move coerentemente entre os quatro frames — mas boa parte do que parece se mover pode ser artefato: pixels saturados, raios cósmicos, hot pixels, halos de estrelas brilhantes, ruído de leitura ou associação errada entre fontes.
+Final astrometric measurements must be performed or reviewed in Astrometrica. MPC-style reports produced by Lia are draft or auxiliary outputs only. Official campaign submission should continue to follow the standard Astrometrica/IASC workflow.
 
-**O problema central é de fadiga cognitiva e escala.** Inspecionar manualmente cada ponto suspeito num conjunto de quatro imagens de 2400×2400 pixels não é viável. É preciso uma triagem automatizada que apresente ao observador apenas os candidatos com maior coerência física — e faça isso de forma auditável, registrando o motivo de cada decisão.
+The triage score is heuristic. It is useful for ranking and auditing, but it is not a calibrated likelihood estimate.
 
-O TRITON resolve isso com um pipeline de dez etapas que parte da imagem crua e entrega uma lista ranqueada de candidatos com coordenadas RA/Dec prontas para revisão no software Astrometrica, disponibilizado pelo IASC para fazer os relatórios. Em execuções com conjuntos reais do IASC, o pipeline reduz dezenas de fontes detectadas por frame a uma lista pequena de trilhas candidatas, registrando por que cada uma foi promovida, penalizada ou descartada.
+## Features
 
----
-
-## Diferenciais Técnicos
-
-### Astrometria referenciada a Gaia DR3
-
-Usar o WCS do header FITS diretamente é simples, mas pode deixar erro sistemático de alguns segundos de arco. Em imagens Pan-STARRS, isso equivale a vários pixels e pode comprometer tanto a posição reportada quanto o rastreamento entre frames.
-
-O TRITON refina o WCS de cada frame independentemente contra o catálogo Gaia DR3 da ESA, usando um cross-match em duas passadas (bruta 15 arcsec + fina 2 arcsec) com propagação de movimento próprio das estrelas de referência. Em testes com o conjunto `o8730g0300o`, a passada bruta identificou offset sistemático de +3.2 arcsec em RA em todos os quatro frames, corrigindo a astrometria antes do rastreamento.
-
-### Rastreamento em coordenadas celestes
-
-Após o refinamento WCS, o casamento entre fontes é feito no plano celeste (arcsec), não em pixels. Isso é fundamental quando frames consecutivos têm pequenos offsets de apontamento ou rotação — situação comum no Pan-STARRS.
-
-### Detecção robusta a saturação
-
-Frames Pan-STARRS podem trazer regiões saturadas em 65535 (limite uint16). Sem mascaramento, esses pixels contaminam a estimativa local de fundo e podem gerar fontes espúrias nas bordas das regiões saturadas. O TRITON mascara pixels ≥ 65500, < 1 e não-finitos antes de qualquer etapa de detecção.
-
-### Score multidimensional auditável
-
-Cada candidato recebe um score de 0 a 12 com sete componentes independentes. Toda decisão — penalização, rejeição ou promoção — é registrada no JSON e no log com a razão explícita. Nenhuma rejeição é silenciosa.
-
-### Fallback gracioso em cadeia
-
-Gaia indisponível → mantém WCS Pan-STARRS e registra status. WCS inválido → fallback para casamento em pixels. SkyBot offline → marca campo sem consulta. Em frames com saturação excessiva, o pipeline aborta cedo para evitar resultado enganoso.
-
----
+- FITS loading with `float64` image handling for numerical stability.
+- Mid-exposure JD/MJD extraction from `DATE-OBS` or `MJD-OBS` plus exposure time.
+- Local sky estimation with `photutils.Background2D`.
+- Source detection with `DAOStarFinder`.
+- Sub-pixel centroid refinement using a Moffat PSF model with Gaussian fallback.
+- FWHM and morphology checks to reject hot pixels, cosmic-ray-like detections, blends, and extended sources.
+- Optional Gaia DR3 WCS refinement with two-stage cross-matching and residual tracking.
+- Header-only WCS mode for internal Gaia-vs-header comparisons.
+- Four-frame track construction in a local tangent-plane representation.
+- Linear kinematic validation with residuals and `R^2`.
+- SkyBot/IMCCE neighborhood checks for known Solar System objects.
+- JSON, text report, draft MPC text, PNG cutouts, and CSV validation exports.
 
 ## Workflow
 
-O TRITON se encaixa entre o recebimento dos FITS do IASC e a revisão final no Astrometrica:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  IASC distribui conjunto de 4 FITS  (e-mail / portal)           │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│  TRITON  (este pipeline)                                              │
-│                                                                       │
-│  venv/bin/python src/detector.py --imagens fits/ --output resultados/ │
-│                                                                       │
-│  Saída:                                                               │
-│    candidatos.json   ← lista ranqueada, scores, coordenadas           │
-│    relatorio.txt     ← priorização operacional                        │
-│    MPC_report.txt    ← rascunho 80 colunas para candidatos ≥ 6        │
-│    candidatos.png    ← recortes visuais dos top candidatos            │
-│    pipeline.log      ← auditoria completa das decisões                │
-└─────────────────────────────┬─────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Observador inspeciona candidatos FORTE e MODERADO no           │
-│  Astrometrica, re-mede posições e preenche magnitudes           │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Submissão ao IASC/MPC após validação humana                    │
-└─────────────────────────────────────────────────────────────────┘
+```text
+IASC FITS set
+-> Lia pre-screening
+-> prioritized candidate list
+-> manual inspection and measurement in Astrometrica
+-> Astrometrica MPC report
+-> IASC submission when appropriate
+-> IASC operational feedback, when available
 ```
 
-**Tempo típico por conjunto:** 15–45 segundos (depende da latência da consulta Gaia DR3 e SkyBot).
-
----
-
-## Como Funciona
-
-```
-4 arquivos .fits
-      │
-      ▼
-[1] Carregamento         Lê FITS, extrai WCS (com CROTA preservado),
-                         timestamps e fração de pixels saturados
-      │
-      ▼
-[2] Máscara de pixels    Saturação ≥ 65500, valores < 1, não-finitos
-      │
-      ▼
-[3] Detecção de fontes   Background2D (malha local 50×50 px) +
-                         DAOStarFinder (threshold --sigma) +
-                         ajuste PSF sub-pixel (Moffat / Gaussiana)
-      │
-      ▼
-[4] Refinamento WCS      Gaia DR3: passada bruta (15 arcsec) →
-                         corrige CRVAL → passada fina (2 arcsec) →
-                         aceita se RMS < 0.9 arcsec
-      │
-      ▼
-[5] Rastreamento         Fontes convertidas para RA/Dec pelo WCS
-                         de cada frame → casamento mútuo recíproco
-                         no plano celeste (arcsec)
-      │
-      ▼
-[6] Rejeição de FP       Borda, SNR baixo, hot pixel suspeito,
-                         brilho caótico, elongação grave
-      │
-      ▼
-[7] Score (0–12)         Linearidade · Velocidade · Fotometria ·
-                         Morfologia · Consistência · Elongação ·
-                         Faixa de velocidade MBA
-      │
-      ▼
-[8] Conversão RA/Dec     WCS refinado por Gaia quando disponível
-      │
-      ▼
-[9] Consulta SkyBot      Vizinhança posicional via IMCCE (raio 2')
-      │
-      ▼
-[10] Outputs             .json  .txt  _MPC_report.txt  .png  .log
-```
-
----
-
-## Instalação
-
-**Pré-requisitos:** Python 3.10+, pip, conexão com internet para Gaia DR3 e SkyBot.
-
-Sem rede, o pipeline mantém fallback transparente para o WCS Pan-STARRS e marca o status da consulta.
+## Installation
 
 ```bash
-# Clone ou extraia o repositório
-git clone https://github.com/jacianabarbosa/triton.git
-cd triton
+git clone https://github.com/jacianabarbosa/lia-astrometry.git
+cd lia-astrometry
 
-# Ambiente virtual (recomendado)
-python3 -m venv venv
-source venv/bin/activate        # macOS/Linux
-
-# Dependências
-venv/bin/python -m pip install --upgrade pip
-venv/bin/python -m pip install -r requirements.txt
-
-# Verificação
-venv/bin/python -m pytest testes/teste_basico.py -v
-```
-
-> **macOS com pyenv:** use `pyenv local 3.13.1` antes de criar o venv se `python3` não encontrar a versão correta.
-
-### Recriar o venv se a pasta mudou de nome
-
-Se o projeto foi renomeado ou movido, recrie o venv:
-
-```bash
-deactivate 2>/dev/null
-rm -rf venv
 python3 -m venv venv
 source venv/bin/activate
+
 venv/bin/python -m pip install --upgrade pip
 venv/bin/python -m pip install -r requirements.txt
+venv/bin/python -m pytest tests/test_basic.py -v
 ```
 
-Use `venv/bin/python -m pip` em vez de `pip` direto no macOS para garantir que as dependências sejam instaladas no Python do projeto.
+## Usage
 
----
-
-## Uso
+Basic run:
 
 ```bash
-# Modo básico (4 arquivos .fits na pasta imagens/)
-venv/bin/python src/detector.py
-
-# Pasta personalizada
-venv/bin/python src/detector.py --imagens /meus/fits/ --output /meus/resultados/
-
-# Ajustar sensibilidade (padrão: 5.5σ)
-venv/bin/python src/detector.py --sigma 5.0   # mais sensível — mais falsos positivos
-venv/bin/python src/detector.py --sigma 6.5   # menos sensível — mais conservador
-
-# Modo offline (sem consulta ao SkyBot)
-venv/bin/python src/detector.py --sem-mpc
-
-# Identificação do observador (necessário antes de enviar ao IASC)
-venv/bin/python src/detector.py --observador "Jaciana Barbosa" --email "seu@email.com"
-
-# Ou via variável de ambiente (evita repetir a cada execução)
-export TRITON_OBS="Jaciana Barbosa"
-export TRITON_EMAIL="seu@email.com"
+venv/bin/python src/detector.py --images images/XY14_p10 --output results/XY14_p10
 ```
 
-**Todas as opções:**
+Adjust the detection threshold:
 
-```
---imagens     Pasta com os 4 arquivos FITS     (padrão: imagens/)
---output      Pasta para salvar resultados     (padrão: resultados/)
---sigma       Threshold de detecção em sigma   (padrão: 5.5)
---sem-mpc     Pular consulta ao catálogo
---observador  Nome do observador
---email       Email do observador
+```bash
+venv/bin/python src/detector.py --sigma 5.0
+venv/bin/python src/detector.py --sigma 6.5
 ```
 
----
+Skip the SkyBot/MPC neighborhood query:
 
-## Outputs Gerados
-
-Para cada conjunto processado, o pipeline gera 5 arquivos em `resultados/`:
-
-### `*_candidatos.json` — Registro estruturado e auditável
-
-O JSON é o output principal. Contém:
-
-- **Cabeçalho global:** pipeline, conjunto, data de processamento, observatório
-- **Métricas globais:** fontes por frame, trilhas tentadas, deriva diagnóstica, saturação por frame, status Gaia por frame, sigma usado, tempo de execução, distribuição de classes
-- **Por candidato:**
-  - `rank`, `classe`, `score_total`, `probabilidade`
-  - `score_componentes`: decomposição completa com máximos por componente
-  - `flags`: lista de flags diagnósticas
-  - `posicao_frame1`: pixel x/y, RA/Dec, formatos MPC
-  - `movimento`: deslocamento total, resíduo de deriva, linearidade, velocidade em arcsec/min
-  - `fotometria`: brilho por frame, CV, pontualidade, SNR por frame
-  - `trilha`: posição, coordenadas, fluxo e SNR frame a frame
-  - `mpc`: status da consulta SkyBot com campos estruturados
-  - `razoes_decisao`: penalizações e rejeições com texto explícito
-
-Exemplo de estrutura:
-
-```json
-{
-  "pipeline": "TRITON v1.4.2",
-  "conjunto": "o8723g0213o",
-  "metricas_globais": {
-    "n_fontes_por_frame": [42, 39, 41, 40],
-    "n_trilhas_tentadas": 35,
-    "sigma_deteccao": 5.5,
-    "tempo_execucao_s": 18.4,
-    "saturacao_pct_por_frame": [0.02, 0.01, 0.02, 0.01],
-    "gaia_refinamento": [
-      {
-        "frame": "o8723g0213o.fits",
-        "status": "gaia_refinado",
-        "n_matches_bruto": 29,
-        "offset_bruto_arcsec": [3.2, 0.4],
-        "n_matches_fino": 29,
-        "rms_pre_arcsec": 0.664,
-        "rms_pos_arcsec": 0.664
-      }
-    ]
-  },
-  "candidatos": [
-    {
-      "rank": 1,
-      "classe": "FORTE",
-      "score_total": 9,
-      "score_componentes": {
-        "linearidade": 3, "velocidade": 2, "fotometria": 2,
-        "morfologia": 2, "consist_morfologica": 0,
-        "elongation": 0, "faixa_vel": 0,
-        "score_max": 12
-      },
-      "flags": ["LINEARIDADE_BOA", "VELOCIDADE_CONSISTENTE",
-                "BRILHO_ESTAVEL", "MORFOLOGIA_PONTUAL", "MPC_SEM_MATCH"],
-      "trilha": [
-        {
-          "frame_index": 0,
-          "timestamp_utc": "2019-08-28T10:18:00",
-          "x": 835.3, "y": 1472.1,
-          "ra_deg": 329.4412, "dec_deg": -12.1987,
-          "flux": 3241.5, "snr": 8.2, "wcs_valido": true
-        }
-      ],
-      "mpc": { "status": "sem_match", "n_objetos_no_cone": 0, "match": null }
-    }
-  ]
-}
+```bash
+venv/bin/python src/detector.py --no-mpc
 ```
 
-### `*_relatorio.txt` — Relatório operacional
+Observer metadata can be passed directly or through environment variables:
 
-Organizado para uso prático no fluxo do Astrometrica:
-
-1. **Métricas do conjunto** — contexto da execução, status Gaia por frame
-2. **Priorização operacional** — candidatos agrupados por urgência de inspeção
-3. **Detalhamento por candidato** — score decomposto, flags, trilha frame a frame, status MPC, razões de decisão
-
-### `*_MPC_report.txt` — Rascunho no formato MPC 80-colunas
-
-Contém apenas candidatos com score ≥ 6 (MODERADO+). Magnitude deixada em branco — requer calibração fotométrica no Astrometrica via UCAC4 ou Gaia DR3. **Não enviar ao IASC sem revisão e re-medição no Astrometrica.**
-
-### `*_candidatos.png` — Suporte visual
-
-Recortes dos 4 frames para cada candidato (top-5 não-DESCARTA), com:
-- Círculo na posição atual
-- Marcadores de posição anterior
-- Vetor indicando direção de movimento
-- Rank, score e flags resumidas
-
-### `*_pipeline.log` — Auditoria completa
-
-Registro cronológico de todas as etapas: contagem de fontes, saturação por frame, status e RMS do refinamento Gaia, offset bruto por frame, deriva diagnóstica, resultados SkyBot, razões de cada rejeição.
-
----
-
-## Score e Flags
-
-### Heurística de Coerência Cinemática (0–12)
-
-O score quantifica em que medida o candidato se comporta como um corpo do Sistema Solar em movimento retilíneo uniforme. É composto por 7 componentes independentes com thresholds centralizados na classe `T` em `detector.py`.
-
-| Componente              | Máx | O que mede                                             |
-|-------------------------|-----|--------------------------------------------------------|
-| Linearidade             |  3  | Resíduo da regressão linear na trilha (px)             |
-| Velocidade              |  2  | Uniformidade dos passos entre frames (σ px)            |
-| Fotometria              |  2  | Coeficiente de variação do brilho integrado            |
-| Morfologia              |  2  | Pontualidade do perfil (pico / fluxo total)            |
-| Consist. morfológica    |  1  | Estabilidade da pontualidade entre os 4 frames         |
-| Elongação               |  1  | Razão eixo maior/menor via PCA dos pixels              |
-| Faixa velocidade (MBA)  |  1  | Deslocamento total na faixa típica de Main Belt (4–50 px) |
-
-| Score | Classe   | Significado operacional                                   |
-|-------|----------|-----------------------------------------------------------|
-| 8–12  | FORTE    | Candidato com múltiplas características de asteroide real |
-| 6–7   | MODERADO | Candidato plausível, verificar no Astrometrica            |
-| 4–5   | FRACO    | Baixa confiança, verificar se houver tempo                |
-| 0–3   | DESCARTA | Provável artefato, ruído ou fonte estendida               |
-
-Candidatos com **razão de rejeição** recebem `DESCARTA` independente do score calculado.
-
-**O score é heurístico, não uma probabilidade calibrada.** Um FORTE pode ser uma estrela variável; um FRACO pode ser um asteroide real em campo degradado. Toda decisão final deve ser tomada no Astrometrica.
-
-### Rejeição de falsos positivos
-
-| Condição                    | Critério                                                |
-|-----------------------------|---------------------------------------------------------|
-| Borda do frame              | Centroide a < 30 px da borda em qualquer frame         |
-| SNR insuficiente            | SNR < 2.0 em ≥ 2 dos 4 frames                          |
-| Hot pixel suspeito          | Pontualidade > 0.70 e SNR médio < 3.0                  |
-| Brilho caótico              | CV do brilho > 1.5                                      |
-| Elongação grave sistemática | Elongação média > 3.0 e máxima > 4.0 em todos os frames|
-
-### Refinamento WCS Gaia DR3
-
-| Status                      | Significado                                            |
-|-----------------------------|--------------------------------------------------------|
-| `gaia_refinado`             | Translação bruta aceita (RMS < 0.9 arcsec)            |
-| `gaia_offset_bruto_apenas`  | Translação aplicada; passada fina insuficiente         |
-| `gaia_skipped_pre_baixo`    | WCS Pan-STARRS já dentro da tolerância                |
-| `gaia_falhou_rede`          | Gaia não respondeu                                     |
-| `gaia_falhou_match`         | Estrelas insuficientes no campo                        |
-| `wcs_invalido`              | Frame sem WCS válido                                   |
-
-### Flags diagnósticas
-
-| Flag                     | Significado                                               |
-|--------------------------|-----------------------------------------------------------|
-| `LINEARIDADE_BOA`        | Resíduo linear < 1.5 px                                  |
-| `LINEARIDADE_RUIM`       | Resíduo linear ≥ 2.5 px                                  |
-| `VELOCIDADE_CONSISTENTE` | σ dos passos < 3 px                                      |
-| `VELOCIDADE_IRREGULAR`   | σ dos passos ≥ 5 px                                      |
-| `BRILHO_ESTAVEL`         | CV do brilho < 0.25                                      |
-| `BRILHO_INSTAVEL`        | CV do brilho ≥ 0.50                                      |
-| `MORFOLOGIA_PONTUAL`     | Pontualidade média > 0.12                                |
-| `MORFOLOGIA_ESTENDIDA`   | Pontualidade média ≤ 0.06                                |
-| `ELONGACAO_ALTA`         | Elongação média ≥ 1.6                                    |
-| `MORFO_INCONSISTENTE`    | std(pontualidade entre frames) ≥ 0.08                    |
-| `EDGE_FRAME`             | Centroide a < 30 px da borda em algum frame              |
-| `REJEITADO_FP`           | Candidato descartado por heurística de falso positivo    |
-| `MPC_SEM_MATCH`          | SkyBot não retornou objetos no cone de 2'                |
-| `MPC_MATCH_PROVAVEL`     | Um objeto conhecido encontrado no cone                   |
-| `MPC_MATCH_AMBIGUO`      | Mais de um objeto no cone — verificar manualmente        |
-| `MPC_CONSULTA_FALHOU`    | Erro na consulta (sem rede, timeout, coordenadas inválidas) |
-
----
-
-## Limitações
-
-- **Sem calibração fotométrica absoluta.** Magnitude no relatório MPC fica em branco. Preencher no Astrometrica via UCAC4 ou Gaia DR3 antes de qualquer envio.
-
-- **WCS Pan-STARRS com fallback.** O pipeline refina com Gaia DR3 quando possível. Se Gaia estiver indisponível ou o RMS não atingir a tolerância, o WCS do header é preservado. Use sempre as coordenadas re-medidas no Astrometrica para submissão.
-
-- **Score heurístico, não probabilístico.** Os thresholds foram ajustados com base em critérios físicos observacionais mas não foram calibrados estatisticamente em conjuntos rotulados.
-
-- **Heurísticas de FP podem rejeitar candidatos legítimos.** Em campos com PSF degradada, seeing ruim ou artefatos globais, elongação ou SNR podem descartar objetos reais. Revise sempre candidatos `REJEITADO_FP` em campos suspeitos.
-
-- **Dependência de rede.** Refinamento Gaia DR3 e consulta SkyBot dependem de serviços externos (ESA TAP e IMCCE). O pipeline tem fallback gracioso, mas a execução offline reduz informação astrométrica e catalógica.
-
-- **4 frames, campos Pan-STARRS.** Desenvolvido e testado para sequências IASC/Pan-STARRS. Outros telescópios, escalas de pixel ou cadências podem exigir ajuste de thresholds na classe `T`.
-
----
-
-## Estrutura do Projeto
-
+```bash
+venv/bin/python src/detector.py --observer "Jaciana Barbosa" --email "name@example.com"
+export LIA_OBS="Jaciana Barbosa"
+export LIA_EMAIL="name@example.com"
 ```
-triton/
-├── src/
-│   └── detector.py              ← Pipeline principal (TRITON)
-├── imagens/                     ← Coloque seus arquivos .fits aqui
-├── resultados/                  ← Outputs gerados automaticamente
-├── testes/
-│   └── teste_basico.py          ← 72 testes unitários e de integração
+
+## Running With Gaia And Header-Only WCS Modes
+
+Gaia DR3 refinement is the default mode:
+
+```bash
+venv/bin/python src/detector.py --images fits/set01 --output results/set01_gaia --wcs-mode gaia
+```
+
+Header-only mode disables only Gaia refinement. Background estimation, PSF fitting, tracking, scoring, filters, thresholds, and output generation remain the same:
+
+```bash
+venv/bin/python src/detector.py --images fits/set01 --output results/set01_header --wcs-mode header
+```
+
+This allows an internal comparison using the same code path:
+
+```text
+candidate recovery
+ranking changes
+RA/Dec differences
+angular separation from Astrometrica measurements
+Gaia RMS and number of Gaia matches
+cases where Gaia improves, does not change, or worsens preliminary coordinates
+```
+
+Only the final Astrometrica report should be submitted to IASC. The Gaia/header comparison is methodological and internal; do not submit duplicate reports.
+
+## Outputs
+
+For each processed set, Lia writes:
+
+- `*_candidates.json`: structured run metadata, candidates, tracks, scores, morphology, WCS status, Gaia status, SkyBot status, and manual-validation placeholders.
+- `*_report.txt`: readable operational report for candidate review.
+- `*_MPC_report.txt`: draft MPC-style auxiliary output for review only.
+- `*_candidates.png`: visual cutouts for top candidates.
+- `*_pipeline.log`: scientific audit trail for the run.
+
+The JSON contains `run_metadata` with `run_id`, `pipeline_name`, `pipeline_version`, `repository`, `input_set`, `timestamp_execution_utc`, `wcs_mode`, and `sigma`.
+
+Each candidate includes `candidate_id`, `triage_class`, `heuristic_score`, `score_components`, `decision_reasons`, `track`, `motion`, `photometry`, `morphology`, and manual-review fields for later Astrometrica/IASC evaluation. Portuguese legacy fields may remain during the transition for backward compatibility, but the English schema is the public target.
+
+## Exporting Metrics
+
+Lia includes a CSV exporter for validation studies:
+
+```bash
+venv/bin/python tools/export_metrics.py results/ --out validation_metrics --recursive
+```
+
+This produces:
+
+- `validation_metrics_sets.csv`: one row per processed set.
+- `validation_metrics_candidates.csv`: one row per candidate.
+
+The CSV files include empty columns such as `measured_in_astrometrica`, `included_in_astrometrica_mpc`, `iasc_feedback`, `manual_classification`, and `notes` where campaign results can be added after human review.
+
+## Score And Flags
+
+The triage score ranges from 0 to 12 and combines:
+
+- linearity of the four-frame track;
+- consistency of frame-to-frame motion;
+- relative photometric stability;
+- point-source morphology;
+- morphology consistency across frames;
+- elongation;
+- motion range typical of main-belt asteroid candidates in short IASC sequences.
+
+Classes:
+
+| Score | Class | Meaning |
+|---:|---|---|
+| 8-12 | `STRONG` | inspect first |
+| 6-7 | `MODERATE` | plausible candidate |
+| 4-5 | `WEAK` | low-priority candidate |
+| 0-3 | `DISCARDED` | likely artifact or rejected source |
+
+The score is a reproducible triage heuristic, not a calibrated statistical confidence value.
+
+## Validation Plan
+
+### Main Operational Evaluation
+
+Run Lia in Gaia mode on IASC sets:
+
+```text
+IASC FITS set
+-> Lia with Gaia DR3
+-> prioritized candidate list
+-> manual inspection in Astrometrica
+-> Astrometrica MPC report
+-> IASC submission
+-> IASC operational feedback, when available
+```
+
+Primary metrics:
+
+- reduction of candidate search space;
+- top-1/top-3/top-5 usefulness;
+- candidates measurable in Astrometrica;
+- candidates included in an Astrometrica MPC report;
+- IASC feedback, when available;
+- false positives and failure modes.
+
+### Internal Gaia Comparison
+
+Run the same sets in both modes:
+
+```bash
+venv/bin/python src/detector.py --wcs-mode gaia
+venv/bin/python src/detector.py --wcs-mode header
+```
+
+Compare recovery, ranking, Gaia RMS, match counts, and angular differences relative to Astrometrica measurements. This comparison is internal; only the final Astrometrica-generated report should enter the official IASC workflow.
+
+## Limitations
+
+- Lia does not replace Astrometrica.
+- The triage score is heuristic, not a calibrated statistical confidence value.
+- Gaia DR3 refinement may fail, may be unnecessary, or may not improve every field.
+- Header WCS may already be sufficient in some IASC frames.
+- PSF fitting can fail for low-SNR, blended, saturated, or edge sources.
+- `Background2D` parameters require empirical validation on campaign data.
+- False-positive rejection can reject real candidates under degraded seeing or severe artifacts.
+- IASC feedback is operational validation, not universal ground truth.
+- Lia does not perform orbit determination, digest2 scoring, shift-and-stack, CNN classification, or automatic MPC/IASC submission.
+
+## Project Structure
+
+```text
+lia-astrometry/
+├── README.md
 ├── docs/
-│   └── metodologia.md           ← Documentação técnica detalhada
+│   └── methodology.md
+├── src/
+│   └── detector.py
+├── tests/
+│   └── test_basic.py
+├── tools/
+│   └── export_metrics.py
 ├── requirements.txt
-├── .gitignore
-└── README.md
+└── pytest.ini
 ```
 
----
+## Methodology
 
-## Referências
+The full technical methodology is maintained in [docs/methodology.md](docs/methodology.md). It covers FITS metadata handling, mid-exposure timing, Background2D, PSF fitting, Gaia DR3 cross-matching, WCS residuals, kinematic validation, false-positive rejection, output schema, and planned validation.
 
-- **Gaia Collaboration (2023)** — *Gaia Data Release 3*. A&A 674, A1. [doi:10.1051/0004-6361/202243940](https://doi.org/10.1051/0004-6361/202243940)
-- **Miller et al. (2024)** — *The International Astronomical Search Collaboration (IASC)*. PASP 136, 024502. [ResearchGate](https://www.researchgate.net/publication/378410609)
-- **Berthier et al.** — SkyBot / IMCCE. [ssd.imcce.fr/webservices/skybot](https://ssd.imcce.fr/webservices/skybot/)
-- **Minor Planet Center** — MPC Submission Guidelines. [minorplanetcenter.net](https://minorplanetcenter.net/iau/info/Astrometry.html)
-- **Bradley et al. (2024)** — *photutils: Astronomical source detection and photometry*. Zenodo. [doi:10.5281/zenodo.596036](https://doi.org/10.5281/zenodo.596036)
-- **Astropy Collaboration (2022)** — *The Astropy Project*. ApJ 935, 167. [doi:10.3847/1538-4357/ac7c74](https://doi.org/10.3847/1538-4357/ac7c74)
+## References
 
-### Stack técnica
+- Gaia Collaboration et al. (2023), *Gaia Data Release 3*, Astronomy & Astrophysics, 674, A1.
+- Bradley et al. (2024), *astropy/photutils: source detection and photometry tools*.
+- Astropy Collaboration et al. (2022), *The Astropy Project: sustaining and growing a community-oriented open-source project*.
+- IMCCE SkyBot documentation.
+- Minor Planet Center astrometry and observation-format documentation.
+- IASC public campaign materials and Astrometrica workflow guidance.
 
-| Biblioteca      | Versão mínima | Uso                                    |
-|-----------------|---------------|----------------------------------------|
-| astropy         | 6.0           | FITS I/O, WCS, coordenadas, tempo      |
-| photutils       | 1.13          | Detecção de fontes (DAOStarFinder)     |
-| astroquery      | 0.4.7         | Gaia TAP, SkyBot/IMCCE                 |
-| astropy-healpix | 1.0           | Suporte astrométrico/catálogos         |
-| numpy           | 1.26          | Operações matriciais                   |
-| scipy           | 1.13          | KDTree para cross-match                |
-| matplotlib      | 3.9           | Visualizações                          |
-| pytest          | 8.0           | Testes                                 |
+## License
 
----
+MIT License. See [LICENSE](LICENSE).
 
 ## Changelog
 
-### v1.4.2 (2026-04)
+### v1.5.0
 
-- Correção do WCS Pan-STARRS com `CROTA` preservado
-- Passada bruta com votação 2D de translação; wrap correto de RA
-- Ajuste afim com sigma-clipping; aceite direto do WCS bruto quando RMS < 0.9 arcsec
-- 72 testes; status `gaia_refinado` validado em `o8730g0300o` com RMS 0.66–0.85 arcsec
+- Renamed the project from previous internal/public names to **Lia**.
+- Updated repository identity to `lia-astrometry`.
+- Updated documentation for international publication readiness.
+- Added or revised scientific traceability fields for validation with IASC/Astrometrica workflows.
+- Clarified that Lia is a pre-screening pipeline and does not replace Astrometrica or official MPC/IASC validation.
+- Prepared documentation for internal comparison between Gaia DR3 refinement and header-only WCS mode.
 
-### v1.4.1 (2026-04)
+### Earlier History
 
-- Cross-match Gaia em duas passadas para contornar erro inicial de 5–7 arcsec do WCS Pan-STARRS
-- Nova função `_estimar_offset_grosseiro` com mediana robusta a outliers
-
-### v1.4.0 (2026-04)
-
-- Refinamento astrométrico por Gaia DR3 por frame
-- Remoção da heurística cinemática em pixels (substituída por astrometria absoluta)
-
-### v1.3.x (2026-04)
-
-- v1.3.2: estimativa de deriva por par de frames (workaround, removido em v1.4)
-- v1.3.1: mascaramento de pixels saturados antes de Background2D e DAOStarFinder
-- v1.3.0: score multidimensional, morfologia por PCA, rejeição de falsos positivos
-
----
-
-## Licença
-
-MIT License — veja [LICENSE](LICENSE) para detalhes.
-
----
-
-**Jaciana Barbosa**  
-Cientista da Computação | Astrônoma Amadora  
-Icapuí, Ceará, Brasil
+Earlier internal builds developed the core detection, Background2D, PSF fitting, Gaia DR3 WCS refinement, SkyBot checks, audit logs, and draft MPC output. Lia is the current public identity for that work.
