@@ -11,12 +11,16 @@ env/
 imagens/*.fits
 imagens/*.fit
 imagens/*.fts
+imagens/**/*.fits
+imagens/**/*.fit
+imagens/**/*.fts
 
 # Resultados gerados (opcional — comente se quiser versionar)
 resultados/*.png
 resultados/*.txt
 resultados/*.json
 resultados/*.log
+resultados_debug/
 
 # macOS
 .DS_Store
