@@ -224,6 +224,10 @@ class T:
     DERIVA_ESTAVEL_PX    = 2.0
     DERIVA_MIN_ESTAVEIS  = 5
 
+    # Astrometria: incerteza e rejeição de fonte estática Gaia
+    GAIA_STATIC_MATCH_ARCSEC = 1.5
+    GAIA_STATIC_MIN_FRAMES   = 3
+
 
 # ─────────────────────────────────────────────
 # Cores para terminal + logging
@@ -338,7 +342,7 @@ def _consultar_gaia_dr3(ra_centro: float, dec_centro: float,
             mag_min = T.GAIA_MAG_MIN
 
         query = f"""
-        SELECT ra, dec, pmra, pmdec, phot_g_mean_mag, ref_epoch
+        SELECT source_id, ra, dec, pmra, pmdec, phot_g_mean_mag, ref_epoch
         FROM gaiadr3.gaia_source
         WHERE 1=CONTAINS(POINT('ICRS', ra, dec),
                          CIRCLE('ICRS', {ra_centro}, {dec_centro},
@@ -647,6 +651,7 @@ def _refinar_wcs_gaia(frame: dict, sigma_deteccao: float = None) -> dict:
         return frame
 
     tabela_gaia = _aplicar_movimento_proprio_gaia(tabela_gaia, frame["jd"])
+    frame["gaia_catalogo_refinado"] = tabela_gaia
     gaia_radec  = np.column_stack([
         np.array(tabela_gaia["ra"],  dtype=np.float64),
         np.array(tabela_gaia["dec"], dtype=np.float64),
@@ -908,6 +913,39 @@ def _encontrar_hdu_ciencia(hdul: fits.HDUList) -> int:
     raise ValueError("Nenhuma HDU com imagem 2D encontrada no FITS.")
 
 
+def _extrair_tempos_observacao(header: fits.Header, arquivo: str) -> dict:
+    """Extrai início e meio da exposição em JD, aceitando DATE-OBS ou MJD-OBS."""
+    exptime = float(header.get("EXPTIME", header.get("EXPOSURE", 45.0)))
+    date_obs = str(header.get("DATE-OBS", "")).strip()
+    mjd_obs = header.get("MJD-OBS")
+
+    try:
+        if date_obs:
+            t_inicio = Time(date_obs, format="isot", scale="utc")
+            date_obs_inicio = date_obs
+        elif mjd_obs is not None:
+            t_inicio = Time(float(mjd_obs), format="mjd", scale="utc")
+            date_obs_inicio = t_inicio.isot
+        else:
+            raise ValueError("DATE-OBS/MJD-OBS ausentes")
+    except Exception:
+        log(
+            f"Timestamp inválido ou ausente em {arquivo}: "
+            f"DATE-OBS={date_obs!r}, MJD-OBS={mjd_obs!r}",
+            "ERRO",
+        )
+        sys.exit(1)
+
+    t_mid = t_inicio + (exptime / 2.0) * u.second
+    return {
+        "date_obs_inicio": date_obs_inicio,
+        "date_obs_mid": t_mid.isot,
+        "jd_inicio": float(t_inicio.jd),
+        "jd_mid": float(t_mid.jd),
+        "exptime": exptime,
+    }
+
+
 def carregar_fits(pasta: Path) -> list[dict]:
     """Carrega os 4 arquivos FITS da pasta, ordenados por timestamp."""
     arquivos = sorted(pasta.glob("*.fits")) + sorted(pasta.glob("*.fit"))
@@ -936,13 +974,7 @@ def carregar_fits(pasta: Path) -> list[dict]:
                 wcs = None
                 wcs_ok = False
 
-            date_obs = str(header.get("DATE-OBS", "")).strip()
-            try:
-                t  = Time(date_obs, format="isot", scale="utc")
-                jd = float(t.jd)
-            except Exception:
-                log(f"DATE-OBS inválido ou ausente em {arq.name}: {date_obs!r}", "ERRO")
-                sys.exit(1)
+            tempos = _extrair_tempos_observacao(header, arq.name)
 
             frame_dict = {
                 "arquivo" : arq.name,
@@ -950,9 +982,13 @@ def carregar_fits(pasta: Path) -> list[dict]:
                 "header"  : header,
                 "wcs"     : wcs,
                 "wcs_ok"  : wcs_ok,
-                "date_obs": date_obs,
-                "jd"      : jd,
-                "exptime" : float(header.get("EXPTIME", 45.0)),
+                "date_obs": tempos["date_obs_mid"],
+                "date_obs_inicio": tempos["date_obs_inicio"],
+                "date_obs_mid": tempos["date_obs_mid"],
+                "jd"      : tempos["jd_mid"],
+                "jd_inicio": tempos["jd_inicio"],
+                "jd_mid"  : tempos["jd_mid"],
+                "exptime" : tempos["exptime"],
             }
 
             if wcs_ok:
@@ -979,7 +1015,7 @@ def carregar_fits(pasta: Path) -> list[dict]:
                 frame_dict["sat_pct"] = 0.0
 
             frames.append(frame_dict)
-        log(f"Carregado: {arq.name}  ({date_obs})  "
+        log(f"Carregado: {arq.name}  ({frame_dict['date_obs']})  "
             f"[{data.shape[1]}x{data.shape[0]}]  WCS={'OK' if wcs_ok else 'FALHOU'}")
 
     if not any(f["wcs_ok"] for f in frames):
@@ -1741,6 +1777,102 @@ def _calcular_snr_local(img: np.ndarray, ty: float, tx: float,
     return float(sinal / ruido) if ruido > 0 else 0.0
 
 
+def _calcular_incertezas_astrometricas(
+    frames: list[dict],
+    metricas_morfo: list[dict],
+    snrs: list[float],
+) -> dict:
+    """Estimativa por frame: erro centroidal FWHM/SNR combinado ao RMS Gaia."""
+    por_frame = []
+    sigma_total = []
+    for fi, frame in enumerate(frames):
+        snr = float(snrs[fi]) if fi < len(snrs) and snrs[fi] is not None else 0.0
+        morfo = metricas_morfo[fi] if fi < len(metricas_morfo) else {}
+        fwhm_px = morfo.get("fwhm_est_px") or T.FWHM_PX
+        escala = _escala_pixel_arcsec(frame.get("wcs"))
+        if escala is None:
+            escala = 1.0
+
+        sigma_centroid = None
+        if snr > 0 and np.isfinite(snr):
+            sigma_centroid = float(escala * float(fwhm_px) / (2.355 * snr))
+
+        sigma_wcs = frame.get("wcs_rms_pos_arcsec")
+        sigma_wcs = float(sigma_wcs) if sigma_wcs is not None else None
+
+        componentes = [v for v in (sigma_centroid, sigma_wcs)
+                       if v is not None and np.isfinite(v)]
+        sigma_pos = float(np.sqrt(np.sum(np.square(componentes)))) if componentes else None
+        if sigma_pos is not None:
+            sigma_total.append(sigma_pos)
+
+        por_frame.append({
+            "frame_index": fi,
+            "sigma_centroid_arcsec": round(sigma_centroid, 4)
+                                      if sigma_centroid is not None else None,
+            "sigma_wcs_arcsec": round(sigma_wcs, 4) if sigma_wcs is not None else None,
+            "sigma_pos_arcsec": round(sigma_pos, 4) if sigma_pos is not None else None,
+            "metodo": "FWHM/(2.355*SNR) combinado em quadratura com RMS Gaia",
+        })
+
+    return {
+        "por_frame": por_frame,
+        "sigma_pos_mediana_arcsec": round(float(np.median(sigma_total)), 4)
+                                    if sigma_total else None,
+    }
+
+
+def _avaliar_fonte_estatica_gaia(c: dict, frames: list[dict]) -> dict:
+    """Marca trilhas compatíveis com a mesma fonte Gaia em vários frames."""
+    matches = []
+    source_ids = []
+    for fi, frame in enumerate(frames):
+        tabela = frame.get("gaia_catalogo_refinado")
+        if tabela is None or not frame.get("wcs_ok") or len(tabela) == 0:
+            continue
+
+        try:
+            ra, dec = pixel_para_radec(c["trilha"][fi][1], c["trilha"][fi][0], frame["wcs"])
+            gaia_radec = np.column_stack([
+                np.array(tabela["ra"], dtype=np.float64),
+                np.array(tabela["dec"], dtype=np.float64),
+            ])
+            idx_det, idx_gaia = _cross_match_gaia(
+                np.array([[ra, dec]], dtype=np.float64),
+                gaia_radec,
+                raio_arcsec=T.GAIA_STATIC_MATCH_ARCSEC,
+            )
+            if len(idx_det) == 0:
+                continue
+
+            gi = int(idx_gaia[0])
+            sid = str(tabela["source_id"][gi]) if "source_id" in tabela.colnames else str(gi)
+            source_ids.append(sid)
+            coord_c = SkyCoord(ra=ra * u.deg, dec=dec * u.deg)
+            coord_g = SkyCoord(ra=float(tabela["ra"][gi]) * u.deg,
+                               dec=float(tabela["dec"][gi]) * u.deg)
+            matches.append({
+                "frame_index": fi,
+                "source_id": sid,
+                "dist_arcsec": round(float(coord_c.separation(coord_g).to(u.arcsec).value), 4),
+                "g_mag": round(float(tabela["phot_g_mean_mag"][gi]), 3)
+                         if "phot_g_mean_mag" in tabela.colnames else None,
+            })
+        except Exception:
+            continue
+
+    mesma_fonte = False
+    if source_ids:
+        _, contagens = np.unique(source_ids, return_counts=True)
+        mesma_fonte = int(np.max(contagens)) >= T.GAIA_STATIC_MIN_FRAMES
+
+    return {
+        "status": "fonte_estatica_gaia" if mesma_fonte else "sem_match_estatico",
+        "n_matches": len(matches),
+        "matches": matches,
+    }
+
+
 def analisar_candidato(c: dict, frames: list[dict]) -> dict:
     """
     Calcula métricas, score decomposto, morfologia robusta, flags diagnósticas
@@ -1836,6 +1968,14 @@ def analisar_candidato(c: dict, frames: list[dict]) -> dict:
     razoes_rejeicao = _verificar_falso_positivo(
         c, frames, snrs, metricas_morfo, brilhos
     )
+    incerteza_astrometrica = _calcular_incertezas_astrometricas(
+        frames, metricas_morfo, snrs
+    )
+    gaia_static = _avaliar_fonte_estatica_gaia(c, frames)
+    if gaia_static["status"] == "fonte_estatica_gaia":
+        razoes_rejeicao.append(
+            f"compatível com fonte estática Gaia em {gaia_static['n_matches']}/4 frames"
+        )
 
     # ── Score por componente ─────────────────────────────────────────────────
     move = c["move_total"]
@@ -1926,6 +2066,8 @@ def analisar_candidato(c: dict, frames: list[dict]) -> dict:
 
     if razoes_rejeicao:
         flags.append("REJEITADO_FP")
+    if gaia_static["status"] == "fonte_estatica_gaia":
+        flags.append("GAIA_FONTE_ESTATICA")
 
     # ── Log de decisão ───────────────────────────────────────────────────────
     if razoes_rejeicao:
@@ -1951,6 +2093,8 @@ def analisar_candidato(c: dict, frames: list[dict]) -> dict:
         "fwhm_medio_px"         : fwhm_medio,
         "metricas_morfo"        : metricas_morfo,
         "snrs"                  : snrs,
+        "incerteza_astrometrica": incerteza_astrometrica,
+        "gaia_static"           : gaia_static,
         "score"                 : score,
         "score_bruto"           : score_bruto,
         "score_max"             : score_max,
@@ -2123,8 +2267,7 @@ def gerar_relatorio_mpc(candidatos: list[dict], frames: list[dict],
                 continue
             tx, ty   = trilha[fi][1], trilha[fi][0]
             ra, dec  = pixel_para_radec(tx, ty, frame["wcs"])
-            data_mpc = formatar_data_mpc(frame["jd"]
-                                         + frame["exptime"] / 2.0 / 86400.0)
+            data_mpc = formatar_data_mpc(frame["jd"])
             ra_mpc   = formatar_ra_mpc(ra)
             dec_mpc  = formatar_dec_mpc(dec)
 
@@ -2694,11 +2837,16 @@ def _serializar_trilha(c: dict, frames: list[dict]) -> list[dict]:
                 pass
 
         snr = c.get("snrs", [None, None, None, None])[fi]
+        incertezas_frame = c.get("incerteza_astrometrica", {}).get("por_frame") or []
+        incerteza_frame = incertezas_frame[fi] if fi < len(incertezas_frame) else {}
 
         trilha_json.append({
             "frame_index"   : fi,
             "timestamp_utc" : frame["date_obs"],
+            "timestamp_inicio_utc": frame.get("date_obs_inicio", frame["date_obs"]),
             "jd"            : round(frame["jd"], 6),
+            "jd_inicio"     : round(frame.get("jd_inicio", frame["jd"]), 6),
+            "jd_mid"        : round(frame.get("jd_mid", frame["jd"]), 6),
             "x"             : round(tx, 2),
             "y"             : round(ty, 2),
             "ra_deg"        : ra_deg,
@@ -2707,6 +2855,7 @@ def _serializar_trilha(c: dict, frames: list[dict]) -> list[dict]:
             "dec_fmt"       : dec_fmt,
             "flux"          : round(float(flux), 1),
             "snr"           : round(float(snr), 2) if snr is not None else None,
+            "incerteza_astrometrica": incerteza_frame,
             "wcs_valido"    : frame["wcs_ok"],
         })
     return trilha_json
@@ -2806,6 +2955,13 @@ def exportar_json(candidatos: list[dict], frames: list[dict],
                 "snr_por_frame"   : [round(s, 2) if s is not None else None
                                      for s in c.get("snrs", [])],
             },
+
+            "incerteza_astrometrica": c.get("incerteza_astrometrica", {}),
+            "gaia_static"           : c.get("gaia_static", {
+                "status": "nao_avaliado",
+                "n_matches": 0,
+                "matches": [],
+            }),
 
             "morfologia"        : {
                 "elongation_medio": round(c.get("elong_medio", 1.0), 4),

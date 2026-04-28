@@ -89,8 +89,8 @@ O TRITON se encaixa entre o recebimento dos FITS do IASC e a revisão final no A
 │    candidatos.png    ← recortes visuais dos top candidatos            │
 │    pipeline.log      ← auditoria completa das decisões                │
 └─────────────────────────────┬─────────────────────────────────────────┘
-                         │
-                         ▼
+                              │
+                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  Observador inspeciona candidatos FORTE e MODERADO no           │
 │  Astrometrica, re-mede posições e preenche magnitudes           │

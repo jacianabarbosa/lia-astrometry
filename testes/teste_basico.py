@@ -47,6 +47,7 @@ from detector import (
     _estimar_offset_grosseiro,
     _refinar_wcs_gaia,
     _consultar_gaia_dr3,
+    _extrair_tempos_observacao,
     pixel_para_radec,
     analisar_candidato,
     consultar_catalogo_posicional,
@@ -194,6 +195,26 @@ class TestFormatacaoMPC:
         assert len(partes) == 3
 
 
+class TestTempoObservacao:
+    def test_jd_canonico_usa_meio_da_exposicao(self):
+        h = fits.Header()
+        h["DATE-OBS"] = "2019-08-28T10:00:00"
+        h["EXPTIME"] = 60.0
+        tempos = _extrair_tempos_observacao(h, "tempo.fits")
+
+        assert tempos["jd_mid"] > tempos["jd_inicio"]
+        assert abs((tempos["jd_mid"] - tempos["jd_inicio"]) * 86400.0 - 30.0) < 1e-3
+
+    def test_mjd_obs_como_fallback(self):
+        h = fits.Header()
+        h["MJD-OBS"] = 58723.4166666667
+        h["EXPTIME"] = 40.0
+        tempos = _extrair_tempos_observacao(h, "tempo.fits")
+
+        assert tempos["date_obs_inicio"].startswith("2019-08-28T10:00:00")
+        assert abs((tempos["jd_mid"] - tempos["jd_inicio"]) * 86400.0 - 20.0) < 1e-3
+
+
 # ─────────────────────────────────────────────
 # WCS Pan-STARRS
 # ─────────────────────────────────────────────
@@ -318,6 +339,7 @@ class TestScoreDecomposto:
             "MORFOLOGIA_PONTUAL", "MORFOLOGIA_ESTENDIDA",
             "ELONGACAO_ALTA", "MORFO_INCONSISTENTE",
             "EDGE_FRAME", "REJEITADO_FP",
+            "GAIA_FONTE_ESTATICA",
             "MPC_SEM_MATCH", "MPC_MATCH_PROVAVEL",
             "MPC_MATCH_AMBIGUO", "MPC_CONSULTA_FALHOU",
         }
@@ -351,6 +373,21 @@ class TestScoreDecomposto:
         assert resultado.get("vel_arcsec_min") is None \
             or isinstance(resultado["vel_arcsec_min"], float)
 
+    def test_incerteza_astrometrica_presente(self):
+        resultado = self._rodar()
+        assert "incerteza_astrometrica" in resultado
+        inc = resultado["incerteza_astrometrica"]
+        assert "por_frame" in inc
+        assert len(inc["por_frame"]) == 4
+        assert "sigma_pos_mediana_arcsec" in inc
+
+    def test_gaia_static_schema_presente(self):
+        resultado = self._rodar()
+        assert "gaia_static" in resultado
+        assert resultado["gaia_static"]["status"] in {
+            "sem_match_estatico", "fonte_estatica_gaia",
+        }
+
 
 # ─────────────────────────────────────────────
 # Serialização da trilha (v1.2)
@@ -359,13 +396,17 @@ class TestSerializacaoTrilha:
     def test_schema_completo(self):
         cand   = _candidato_sintetico()
         cand["snrs"] = [12.3, 11.8, 13.1, 12.5]
+        cand["incerteza_astrometrica"] = {
+            "por_frame": [{"sigma_pos_arcsec": 0.1} for _ in range(4)]
+        }
         frames = [_frame_sintetico(date_obs=f"2019-08-28T{10+i}:00:00")
                   for i in range(4)]
         trilha_json = _serializar_trilha(cand, frames)
 
         assert len(trilha_json) == 4
         campos_obrigatorios = {"frame_index", "timestamp_utc", "jd",
-                               "x", "y", "flux", "snr", "wcs_valido"}
+                               "jd_inicio", "jd_mid", "x", "y", "flux",
+                               "snr", "incerteza_astrometrica", "wcs_valido"}
         for entrada in trilha_json:
             for campo in campos_obrigatorios:
                 assert campo in entrada, f"Campo ausente na trilha: {campo}"
@@ -582,12 +623,18 @@ class TestIntegracaoEndToEnd:
             assert "por_frame" in morfo
             assert len(morfo["por_frame"]) == 4
 
+            assert "incerteza_astrometrica" in c
+            assert "por_frame" in c["incerteza_astrometrica"]
+            assert "gaia_static" in c
+            assert "status" in c["gaia_static"]
+
             # Trilha completa
             assert "trilha" in c
             assert len(c["trilha"]) == 4
             for entrada in c["trilha"]:
                 for campo in ("frame_index", "timestamp_utc", "x", "y",
-                              "flux", "wcs_valido"):
+                              "flux", "jd_mid", "incerteza_astrometrica",
+                              "wcs_valido"):
                     assert campo in entrada, f"Campo '{campo}' ausente na trilha"
 
             # MPC normalizado
