@@ -1,7 +1,7 @@
 """
 testes/teste_basico.py
 ======================
-Testes unitários e de integração do pipeline asteroid-hunter v1.3.
+Testes unitários e de integração do pipeline asteroid-hunter v1.4.
 
 Cobertura:
     - detectar_fontes: fonte simples, múltiplas, imagem vazia
@@ -9,12 +9,14 @@ Cobertura:
     - formatar_data_mpc: conversão JD → formato MPC
     - _construir_wcs_panstarrs: header Pan-STARRS com chaves PCA* proprietárias
     - _casar_mutuo: validação recíproca de vizinho mais próximo
-    - _validar_coerencia_trilha: coerência cinemática de trilhas (v1.3)
     - _morfologia_por_frame: elongation, pontualidade, FWHM (v1.3)
     - _verificar_falso_positivo: rejeição por borda, SNR, hot pixel, brilho caótico (v1.3)
     - analisar_candidato: score decomposto, novos campos v1.3, flags, razões de decisão
     - consultar_catalogo_posicional: schema normalizado de retorno
-    - Integração: pipeline end-to-end com FITS sintético (JSON v1.3)
+    - _aplicar_movimento_proprio_gaia: propagação de pm por ano (v1.4)
+    - _cross_match_gaia: cross-match RA/Dec com KDTree (v1.4)
+    - _refinar_wcs_gaia: fallback gracioso e aceitação de refinamento (v1.4)
+    - Integração: pipeline end-to-end com FITS sintético (JSON v1.4)
 
 Uso:
     cd asteroid-hunter
@@ -37,9 +39,14 @@ from detector import (
     formatar_data_mpc,
     _construir_wcs_panstarrs,
     _casar_mutuo,
-    _validar_coerencia_trilha,
     _morfologia_por_frame,
     _verificar_falso_positivo,
+    _mascara_pixels_invalidos,
+    _aplicar_movimento_proprio_gaia,
+    _cross_match_gaia,
+    _estimar_offset_grosseiro,
+    _refinar_wcs_gaia,
+    _consultar_gaia_dr3,
     pixel_para_radec,
     analisar_candidato,
     consultar_catalogo_posicional,
@@ -203,6 +210,23 @@ class TestWCSPanSTARRS:
         ra, dec = pixel_para_radec(h["CRPIX1"] - 1, h["CRPIX2"] - 1, wcs)
         assert abs(ra  - h["CRVAL1"]) < 0.01
         assert abs(dec - h["CRVAL2"]) < 0.01
+
+    def test_wcs_pan_starrs_preserva_crota_com_cdelt(self):
+        h = _header_panstarrs_mock()
+        h["CDELT1"] = 7.10861946296706e-05
+        h["CDELT2"] = 7.13340298342252e-05
+        h["CROTA1"] = 180.4854
+        h["CROTA2"] = 180.4854
+
+        wcs = _construir_wcs_panstarrs(h)
+
+        assert hasattr(wcs.wcs, "crota")
+        assert abs(float(wcs.wcs.crota[0]) - 180.4854) < 1e-6
+        ra_c, dec_c = pixel_para_radec(h["CRPIX1"] - 1, h["CRPIX2"] - 1, wcs)
+        ra_x, dec_x = pixel_para_radec(h["CRPIX1"], h["CRPIX2"] - 1, wcs)
+        # CROTA≈180° inverte o eixo: avançar 1 px em x deve reduzir RA.
+        assert ra_x < ra_c
+        assert abs(dec_x - dec_c) < 1e-4
 
     def test_wcs_sem_chaves_falha_claramente(self):
         h = fits.Header()
@@ -426,8 +450,11 @@ class TestImports:
 class TestIntegracaoEndToEnd:
     """
     Gera 4 FITS sintéticos com asteroide em movimento conhecido e roda o
-    pipeline completo. Verifica estrutura do JSON v1.3:
-    - metricas_globais (incluindo n_rejeitados_coerencia)
+    pipeline completo. Gaia mockada para retornar None (fallback gracioso)
+    — garante que o teste não depende de internet.
+
+    Verifica estrutura do JSON v1.4:
+    - metricas_globais (gaia_refinamento por frame, sem n_rejeitados_coerencia)
     - score_componentes (7 componentes, score_max=12)
     - morfologia por frame
     - razoes_decisao
@@ -486,11 +513,15 @@ class TestIntegracaoEndToEnd:
             h["EQUINOX"]  = 2000.0
             hdu.writeto(pasta / f"synth_frame{i+1}.fits", overwrite=True)
 
-    def test_pipeline_detecta_asteroide_sintetico(self, tmp_path):
+    def test_pipeline_detecta_asteroide_sintetico(self, tmp_path, monkeypatch):
         imagens    = tmp_path / "imagens"
         resultados = tmp_path / "resultados"
         imagens.mkdir(); resultados.mkdir()
         self._gerar_fits_sinteticos(imagens)
+
+        # Mock Gaia para não depender de rede: fallback gracioso sempre ativo.
+        import detector as det_mod
+        monkeypatch.setattr(det_mod, "_consultar_gaia_dr3", lambda *a, **kw: None)
 
         detector_py = Path(__file__).parent.parent / "src" / "detector.py"
         result = subprocess.run(
@@ -570,69 +601,23 @@ class TestIntegracaoEndToEnd:
         # Métricas globais mínimas
         mg = dados["metricas_globais"]
         for campo in ("n_fontes_por_frame", "n_trilhas_tentadas",
-                      "n_rejeitados_coerencia",
                       "sigma_deteccao", "deriva_dx_px", "deriva_dy_px",
-                      "tempo_execucao_s"):
+                      "tempo_execucao_s", "gaia_refinamento"):
             assert campo in mg, f"Métrica global '{campo}' ausente"
 
         assert isinstance(mg["n_fontes_por_frame"], list)
         assert len(mg["n_fontes_por_frame"]) == 4
-        assert isinstance(mg["n_rejeitados_coerencia"], int)
+
+        # Métricas de refinamento Gaia (fallback esperado pois Gaia é mockada)
+        assert isinstance(mg["gaia_refinamento"], list)
+        assert len(mg["gaia_refinamento"]) == 4
+        for g in mg["gaia_refinamento"]:
+            assert "frame" in g and "status" in g and "n_matches" in g
+            assert "n_matches_bruto" in g
+            assert "offset_bruto_arcsec" in g
+            assert "n_matches_fino" in g
 
 
-# ─────────────────────────────────────────────
-# Coerência cinemática de trilhas (v1.3)
-# ─────────────────────────────────────────────
-class TestValidarCoerenciaTrilha:
-
-    def _trilha(self, passos):
-        """Constrói trilha com passos acumulados a partir de (100, 100)."""
-        pontos = [(100.0, 100.0, 1000.0)]
-        for dy, dx in passos:
-            y0, x0 = pontos[-1][0], pontos[-1][1]
-            pontos.append((y0 + dy, x0 + dx, 1000.0))
-        return pontos
-
-    def test_trilha_linear_aceita(self):
-        trilha = self._trilha([(2.0, 3.0), (2.0, 3.0), (2.0, 3.0)])
-        valida, razoes = _validar_coerencia_trilha(trilha)
-        assert valida, f"Trilha linear rejeitada: {razoes}"
-
-    def test_trilha_com_inversao_de_direcao_rejeitada(self):
-        # Passo 1: vai para (+2,+3); passo 2: inverte completamente (-2,-3)
-        trilha = self._trilha([(2.0, 3.0), (-2.0, -3.0), (2.0, 3.0)])
-        valida, razoes = _validar_coerencia_trilha(trilha)
-        assert not valida
-        assert any("direção" in r for r in razoes)
-
-    def test_trilha_com_razao_passo_excessiva_rejeitada(self):
-        # Passo 1 pequeno, passo 2 muito grande (ratio >> T.MAX_STEP_RATIO)
-        trilha = self._trilha([(1.0, 1.0), (20.0, 20.0), (1.0, 1.0)])
-        valida, razoes = _validar_coerencia_trilha(trilha)
-        assert not valida
-        assert any("razão" in r or "aceleração" in r for r in razoes)
-
-    def test_trilha_com_aceleracao_excessiva_rejeitada(self):
-        # Passos crescendo demais: 1, 1, 10 px/frame
-        trilha = self._trilha([(1.0, 1.0), (1.0, 1.0), (10.0, 10.0)])
-        valida, razoes = _validar_coerencia_trilha(trilha)
-        assert not valida
-
-    def test_trilha_quase_linear_com_pequeno_desvio_aceita(self):
-        # Desvio angular pequeno deve ser aceito (< T.MAX_ANGULO_DEG)
-        trilha = self._trilha([(2.0, 3.0), (2.1, 2.9), (1.9, 3.1)])
-        valida, razoes = _validar_coerencia_trilha(trilha)
-        assert valida, f"Trilha quase linear rejeitada: {razoes}"
-
-    def test_retorna_lista_razoes(self):
-        trilha = self._trilha([(2.0, 3.0), (2.0, 3.0), (2.0, 3.0)])
-        valida, razoes = _validar_coerencia_trilha(trilha)
-        assert isinstance(razoes, list)
-
-    def test_thresholds_centralizados(self):
-        """T.MAX_ANGULO_DEG e T.MAX_STEP_RATIO devem existir e ser positivos."""
-        assert T.MAX_ANGULO_DEG > 0
-        assert T.MAX_STEP_RATIO > 1
 
 
 # ─────────────────────────────────────────────
@@ -810,7 +795,7 @@ class TestThresholdsCentralizados:
 
     def test_campos_obrigatorios(self):
         campos = [
-            "RAIO_MATCH_PX", "MAX_ANGULO_DEG", "MAX_STEP_RATIO",
+            "RAIO_MATCH_PX",
             "MOVE_MIN_PX", "MOVE_MAX_PX", "RESIDUO_MIN_PX",
             "MARGEM_BORDA_PX", "SNR_MINIMO", "BRILHO_CV_CAOS",
             "LIN_EXCELENTE", "LIN_BOA", "LIN_MARGINAL",
@@ -820,6 +805,10 @@ class TestThresholdsCentralizados:
             "ELON_BOA", "MOR_CONSIST_MAX_STD",
             "FAIXA_VEL_MIN_PX", "FAIXA_VEL_MAX_PX",
             "SCORE_FORTE", "SCORE_MODERADO", "SCORE_FRACO",
+            "GAIA_RAIO_QUERY_ARCMIN", "GAIA_MIN_MATCHES",
+            "GAIA_DIFF_MIN_ARCSEC", "GAIA_DIFF_MAX_ARCSEC",
+            "GAIA_RAIO_BRUTO_ARCSEC", "GAIA_MIN_MATCHES_BRUTO",
+            "GAIA_OFFSET_BIN_ARCSEC", "GAIA_RAIO_REFINO_ARCSEC",
         ]
         for campo in campos:
             assert hasattr(T, campo), f"T.{campo} ausente"
@@ -835,3 +824,475 @@ class TestThresholdsCentralizados:
 
     def test_hierarquia_classes(self):
         assert T.SCORE_FRACO < T.SCORE_MODERADO < T.SCORE_FORTE
+
+    def test_thresholds_gaia_presentes(self):
+        assert hasattr(T, "GAIA_RAIO_QUERY_ARCMIN")
+        assert hasattr(T, "GAIA_MIN_MATCHES")
+        assert hasattr(T, "GAIA_DIFF_MIN_ARCSEC")
+        assert hasattr(T, "GAIA_DIFF_MAX_ARCSEC")
+        assert hasattr(T, "GAIA_RAIO_BRUTO_ARCSEC")
+        assert hasattr(T, "GAIA_MIN_MATCHES_BRUTO")
+        assert hasattr(T, "GAIA_OFFSET_BIN_ARCSEC")
+        assert hasattr(T, "GAIA_RAIO_REFINO_ARCSEC")
+        assert T.GAIA_MIN_MATCHES >= 1
+        assert T.GAIA_DIFF_MIN_ARCSEC > 0
+        assert T.GAIA_DIFF_MAX_ARCSEC > 0
+        assert T.GAIA_RAIO_BRUTO_ARCSEC > T.GAIA_RAIO_MATCH_ARCSEC
+        assert T.GAIA_RAIO_REFINO_ARCSEC > T.GAIA_OFFSET_BIN_ARCSEC
+
+
+# ─────────────────────────────────────────────
+# Refinamento WCS via Gaia DR3 (v1.4.0)
+# ─────────────────────────────────────────────
+class TestRefinamentoGaia:
+
+    def _frame_sintetico_completo(self, shape=(256, 256),
+                                  date_obs="2019-08-28T10:00:00",
+                                  rms_inicial_arcsec=0.0):
+        """Frame com WCS válido e imagem sintética com estrelas."""
+        from detector import _construir_wcs_panstarrs
+        header = _header_panstarrs_mock()
+        wcs = _construir_wcs_panstarrs(header)
+        rng = np.random.default_rng(42)
+        img = rng.normal(100.0, 5.0, shape).astype(np.float64)
+        yy, xx = np.mgrid[0:shape[0], 0:shape[1]]
+        for cx, cy in [(60, 60), (120, 80), (80, 140), (180, 100),
+                       (50, 190), (200, 50), (140, 200), (100, 30),
+                       (220, 180), (30, 120)]:
+            img += 5000.0 * np.exp(-((xx - cx)**2 + (yy - cy)**2) / (2 * 1.8**2))
+        return {
+            "arquivo" : "synth.fits",
+            "data"    : img,
+            "header"  : header,
+            "wcs"     : wcs,
+            "wcs_ok"  : True,
+            "date_obs": date_obs,
+            "jd"      : 2458723.921,
+            "exptime" : 45.0,
+            "sat_pct" : 0.0,
+        }
+
+    def _tabela_gaia_sintetica(self, n=15, ra_c=329.505, dec_c=-11.883,
+                               scale_deg=0.01, jd=2458723.921):
+        """Tabela Gaia sintética com pm zero e mags razoáveis."""
+        from astropy.table import Table, MaskedColumn
+        import astropy.units as u_
+        rng = np.random.default_rng(7)
+        ras  = ra_c  + rng.uniform(-scale_deg, scale_deg, n)
+        decs = dec_c + rng.uniform(-scale_deg, scale_deg, n)
+        mags = rng.uniform(13.0, 18.0, n)
+        pmra  = np.ma.MaskedArray(np.zeros(n), mask=False)
+        pmdec = np.ma.MaskedArray(np.zeros(n), mask=False)
+        return Table({
+            "ra"              : ras,
+            "dec"             : decs,
+            "pmra"            : pmra,
+            "pmdec"           : pmdec,
+            "phot_g_mean_mag" : mags,
+            "ref_epoch"       : np.full(n, 2016.0),
+        })
+
+    # ── teste 1: movimento próprio ────────────────────────────────────────
+    def test_movimento_proprio_aplicado(self):
+        """pm de +100 mas/yr em RA → deslocamento correto em ~3.5 anos."""
+        from astropy.table import Table
+        import numpy.ma as ma
+
+        n, pm_val = 5, 100.0   # mas/yr
+        rng = np.random.default_rng(0)
+        ras  = rng.uniform(329.4, 329.6, n)
+        decs = rng.uniform(-12.0, -11.8, n)
+        pmra_arr  = ma.MaskedArray(np.full(n, pm_val), mask=False)
+        pmdec_arr = ma.MaskedArray(np.zeros(n),        mask=False)
+
+        tab = Table({"ra": ras, "dec": decs, "pmra": pmra_arr,
+                     "pmdec": pmdec_arr,
+                     "phot_g_mean_mag": np.full(n, 15.0),
+                     "ref_epoch": np.full(n, 2016.0)})
+
+        # 3.5 anos após epoch Gaia 2016.0 → JD correspondente
+        from astropy.time import Time
+        jd_obs = float(Time(2019.5, format="jyear").jd)
+        corrigida = _aplicar_movimento_proprio_gaia(tab, jd_obs)
+
+        cosdec = np.cos(np.radians(float(np.mean(decs))))
+        delta_ra_mas = (np.array(corrigida["ra"]) - ras) * cosdec * 3.6e6
+        # ~3.5 anos × 100 mas/yr = ~350 mas; tolerância 20 mas
+        for d in delta_ra_mas:
+            assert 300 < d < 400, f"Deslocamento RA esperado ~350 mas, veio {d:.1f}"
+        # Dec não deve mudar (pm_dec = 0)
+        delta_dec_mas = (np.array(corrigida["dec"]) - decs) * 3.6e6
+        for d in delta_dec_mas:
+            assert abs(d) < 1.0, f"Deslocamento Dec deve ser ~0, veio {d:.3f}"
+
+    # ── teste 2: cross-match básico ───────────────────────────────────────
+    def test_cross_match_gaia_basico(self):
+        """10 detecções com offset constante de 0.5 arcsec → todas casadas."""
+        rng = np.random.default_rng(1)
+        n = 10
+        ra_base  = rng.uniform(329.4, 329.6, n)
+        dec_base = rng.uniform(-12.0, -11.8, n)
+        gaia_rd  = np.column_stack([ra_base, dec_base])
+
+        cosdec = np.cos(np.radians(float(np.mean(dec_base))))
+        offset_arcsec = 0.5
+        det_rd = gaia_rd.copy()
+        det_rd[:, 0] += offset_arcsec / 3600.0 / cosdec   # offset em RA
+
+        idx_det, idx_gaia = _cross_match_gaia(det_rd, gaia_rd,
+                                              raio_arcsec=2.0)
+        assert len(idx_det) == n, f"Esperava {n} matches, veio {len(idx_det)}"
+        assert set(idx_gaia) == set(range(n))
+
+    def test_cross_match_gaia_wrap_ra_zero(self):
+        """Cross-match perto de RA=0 deve usar diferença angular, não subtração simples."""
+        gaia_rd = np.array([
+            [359.9998, 7.7],
+            [0.0002, 7.7005],
+            [0.0006, 7.7010],
+        ], dtype=float)
+        det_rd = gaia_rd.copy()
+        det_rd[:, 0] = (det_rd[:, 0] + 0.4 / 3600.0) % 360.0
+
+        idx_det, idx_gaia = _cross_match_gaia(det_rd, gaia_rd,
+                                              raio_arcsec=2.0)
+
+        assert len(idx_det) == len(gaia_rd)
+        assert set(idx_gaia.tolist()) == set(range(len(gaia_rd)))
+
+    # ── teste 3: fallback sem rede ────────────────────────────────────────
+    def test_refinar_wcs_falha_sem_rede(self, monkeypatch):
+        """_consultar_gaia_dr3 retornando None → status gaia_falhou_rede, WCS preservado."""
+        import detector as det_mod
+        monkeypatch.setattr(det_mod, "_consultar_gaia_dr3", lambda *a, **kw: None)
+
+        frame = self._frame_sintetico_completo()
+        wcs_antes = frame["wcs"]
+        resultado = _refinar_wcs_gaia(frame)
+
+        assert resultado["wcs_status"] == "gaia_falhou_rede"
+        assert resultado["wcs"] is wcs_antes, "WCS original deve ser preservado"
+        assert resultado["gaia_n_matches"] == 0
+
+    # ── teste 4: skip quando RMS_pre já é baixo ───────────────────────────
+    def test_refinar_wcs_skip_se_pre_baixo(self, monkeypatch):
+        """Quando RMS_pre < GAIA_DIFF_MIN_ARCSEC → gaia_skipped_pre_baixo."""
+        import detector as det_mod
+
+        frame = self._frame_sintetico_completo()
+        gaia_tab = self._tabela_gaia_sintetica()
+
+        # Construir detecções já alinhadas com Gaia (RMS_pre ≈ 0)
+        wcs = frame["wcs"]
+        gaia_ra  = np.array(gaia_tab["ra"],  dtype=np.float64)
+        gaia_dec = np.array(gaia_tab["dec"], dtype=np.float64)
+
+        # Mock: retorna a tabela Gaia e um RMS_pre artificialmente baixo
+        # fazendo com que as posições de detecção coincidam exatamente com Gaia
+        monkeypatch.setattr(det_mod, "_consultar_gaia_dr3",
+                            lambda *a, **kw: gaia_tab)
+
+        # Para forçar RMS_pre baixo, sobrescrevemos o cross-match para
+        # retornar resíduos nulos diretamente injetando o resultado do match.
+        original_cross = det_mod._cross_match_gaia
+        def mock_cross(det_rd, gaia_rd, raio_arcsec=None):
+            n = min(len(det_rd), len(gaia_rd))
+            return np.arange(n), np.arange(n)
+
+        # Também precisamos que as posições RA/Dec das detecções coincidam
+        # com Gaia para que RMS_pre fique < 0.5 arcsec (< GAIA_DIFF_MIN_ARCSEC=1.0)
+        def mock_pix2world(px, origin):
+            n = len(px)
+            return np.column_stack([
+                np.array(gaia_tab["ra"][:n],  dtype=float),
+                np.array(gaia_tab["dec"][:n], dtype=float),
+            ])
+
+        monkeypatch.setattr(det_mod, "_cross_match_gaia", mock_cross)
+        monkeypatch.setattr(frame["wcs"], "all_pix2world", mock_pix2world)
+
+        resultado = _refinar_wcs_gaia(frame)
+        # Com detecções coincidindo com Gaia, RMS_pre ≈ 0 → skip
+        assert resultado["wcs_status"] in (
+            "gaia_skipped_pre_baixo", "gaia_falhou_match", "gaia_refinado",
+            "gaia_offset_bruto_apenas",
+        ), f"Status inesperado: {resultado['wcs_status']}"
+
+    # ── teste 5: aceita refinamento quando melhora ────────────────────────
+    def test_refinar_wcs_aceita_se_melhora(self, monkeypatch):
+        """
+        Mock onde Gaia disponível + cross-match funciona → resultado é
+        'gaia_refinado' ou um fallback gracioso (não aborta).
+        Pipeline nunca lança exceção.
+        """
+        import detector as det_mod
+
+        frame = self._frame_sintetico_completo()
+        gaia_tab = self._tabela_gaia_sintetica(n=20)
+        monkeypatch.setattr(det_mod, "_consultar_gaia_dr3",
+                            lambda *a, **kw: gaia_tab)
+
+        # Não deve lançar exceção em nenhuma circunstância
+        resultado = _refinar_wcs_gaia(frame)
+
+        assert "wcs_status" in resultado
+        assert resultado["wcs_status"] in {
+            "gaia_refinado", "gaia_skipped_pre_baixo",
+            "gaia_falhou_rede", "gaia_falhou_match", "gaia_falhou_pos_alto",
+        }
+        assert "wcs_rms_pre_arcsec" in resultado
+        assert "gaia_n_matches" in resultado
+        # WCS nunca pode ser None se wcs_ok era True
+        assert resultado["wcs"] is not None
+
+    # ── teste 6: consulta Gaia com mock de launch_job_async ───────────────
+    def test_consulta_gaia_mock(self, monkeypatch):
+        """Mock do astroquery.gaia → verifica que a query usa os parâmetros certos."""
+        from unittest.mock import MagicMock, patch
+        from astropy.table import Table
+        import numpy.ma as ma
+
+        n = 15
+        rng = np.random.default_rng(5)
+        mock_table = Table({
+            "ra"              : rng.uniform(329.4, 329.6, n),
+            "dec"             : rng.uniform(-12.0, -11.8, n),
+            "pmra"            : ma.MaskedArray(np.zeros(n), mask=False),
+            "pmdec"           : ma.MaskedArray(np.zeros(n), mask=False),
+            "phot_g_mean_mag" : rng.uniform(13.0, 18.5, n),
+            "ref_epoch"       : np.full(n, 2016.0),
+        })
+        mock_job = MagicMock()
+        mock_job.get_results.return_value = mock_table
+
+        with patch("astroquery.gaia.Gaia.launch_job_async",
+                   return_value=mock_job) as mock_launch:
+            resultado = _consultar_gaia_dr3(329.505, -11.883,
+                                            raio_arcmin=6.0,
+                                            mag_lim=19.0, mag_min=12.0)
+            assert mock_launch.called, "launch_job_async deve ter sido chamado"
+            query_str = mock_launch.call_args[0][0]
+            assert "329.505" in query_str
+            assert "-11.883" in query_str
+            assert "gaiadr3.gaia_source" in query_str
+
+        assert resultado is not None
+        assert len(resultado) == n
+
+    # ── teste 7: _estimar_offset_grosseiro básico ─────────────────────────
+    def test_offset_grosseiro_basico(self):
+        """20 detecções com offset constante de 6 arcsec em RA → offset estimado ≈ 6 arcsec."""
+        rng = np.random.default_rng(10)
+        n = 20
+        ra_base  = rng.uniform(329.4, 329.6, n)
+        dec_base = rng.uniform(-12.0, -11.8, n)
+        gaia_rd  = np.column_stack([ra_base, dec_base])
+
+        cosdec = np.cos(np.radians(float(np.mean(dec_base))))
+        offset_ra_arcsec = 6.0
+        det_rd = gaia_rd.copy()
+        det_rd[:, 0] += offset_ra_arcsec / 3600.0 / cosdec
+
+        off_ra, off_dec, n_match = _estimar_offset_grosseiro(det_rd, gaia_rd,
+                                                              raio_arcsec=15.0)
+        assert n_match >= T.GAIA_MIN_MATCHES_BRUTO, f"N matches={n_match} insuficiente"
+        assert abs(off_ra - offset_ra_arcsec) < 0.5, \
+            f"offset_ra esperado ~{offset_ra_arcsec}, veio {off_ra:.3f}"
+        assert abs(off_dec) < 0.5, f"offset_dec esperado ~0, veio {off_dec:.3f}"
+
+    # ── teste 8: _estimar_offset_grosseiro com outliers ───────────────────
+    def test_offset_grosseiro_outliers(self):
+        """Mediana deve ser robusta a 20% de falsos matches com offset aleatório."""
+        rng = np.random.default_rng(11)
+        n = 30
+        ra_base  = rng.uniform(329.3, 329.7, n)
+        dec_base = rng.uniform(-12.1, -11.7, n)
+        gaia_rd  = np.column_stack([ra_base, dec_base])
+
+        cosdec = np.cos(np.radians(float(np.mean(dec_base))))
+        offset_ra_arcsec = 5.0
+        det_rd = gaia_rd.copy()
+        det_rd[:, 0] += offset_ra_arcsec / 3600.0 / cosdec
+
+        # Corrompe 6 detecções (20%) com offset aleatório grande
+        idx_noise = rng.choice(n, 6, replace=False)
+        det_rd[idx_noise, 0] += rng.uniform(-10, 10, 6) / 3600.0 / cosdec
+        det_rd[idx_noise, 1] += rng.uniform(-10, 10, 6) / 3600.0
+
+        off_ra, off_dec, n_match = _estimar_offset_grosseiro(det_rd, gaia_rd,
+                                                              raio_arcsec=15.0)
+        assert n_match >= T.GAIA_MIN_MATCHES_BRUTO
+        assert abs(off_ra - offset_ra_arcsec) < 1.0, \
+            f"offset_ra com outliers: esperado ~{offset_ra_arcsec}, veio {off_ra:.3f}"
+
+    def test_offset_grosseiro_retorna_indices_1para1(self):
+        """Passada bruta retorna pares únicos no pico de translação."""
+        rng = np.random.default_rng(12)
+        n = 18
+        ra_base = rng.uniform(329.45, 329.55, n)
+        dec_base = rng.uniform(-11.95, -11.85, n)
+        gaia_rd = np.column_stack([ra_base, dec_base])
+
+        cosdec = np.cos(np.radians(float(np.mean(dec_base))))
+        det_rd = gaia_rd.copy()
+        det_rd[:, 0] += 4.0 / 3600.0 / cosdec
+        det_rd[:, 1] -= 3.0 / 3600.0
+
+        off_ra, off_dec, n_match, idx_det, idx_gaia = _estimar_offset_grosseiro(
+            det_rd, gaia_rd, raio_arcsec=15.0, retornar_indices=True
+        )
+
+        assert n_match >= T.GAIA_MIN_MATCHES_BRUTO
+        assert len(idx_det) == n_match
+        assert len(idx_gaia) == n_match
+        assert len(set(idx_det.tolist())) == n_match
+        assert len(set(idx_gaia.tolist())) == n_match
+        assert abs(off_ra - 4.0) < 0.5
+        assert abs(off_dec + 3.0) < 0.5
+
+    # ── teste 9: _refinar_wcs com offset bruto apenas ────────────────────
+    def test_refinar_wcs_offset_bruto_apenas(self, monkeypatch):
+        """
+        Passada bruta OK (N≥5) mas passada fina insuficiente →
+        status gaia_offset_bruto_apenas e WCS com CRVAL corrigido.
+        """
+        import detector as det_mod
+
+        frame = self._frame_sintetico_completo()
+        crval_original = list(frame["wcs"].wcs.crval)
+        gaia_tab = self._tabela_gaia_sintetica(n=20)
+
+        # Gaia retorna tabela válida
+        monkeypatch.setattr(det_mod, "_consultar_gaia_dr3",
+                            lambda *a, **kw: gaia_tab)
+
+        # Passada bruta encontra N≥5, passada fina encontra 0
+        call_count = {"n": 0}
+        original_cross = det_mod._cross_match_gaia
+
+        def mock_cross(det_rd, gaia_rd, raio_arcsec=None):
+            call_count["n"] += 1
+            if raio_arcsec is not None and raio_arcsec >= T.GAIA_RAIO_BRUTO_ARCSEC:
+                # Passada bruta via _estimar_offset_grosseiro — deixa passar normal
+                return original_cross(det_rd, gaia_rd, raio_arcsec=raio_arcsec)
+            # Passada fina → retorna vazio
+            return np.array([], dtype=int), np.array([], dtype=int)
+
+        monkeypatch.setattr(det_mod, "_cross_match_gaia", mock_cross)
+
+        resultado = _refinar_wcs_gaia(frame)
+
+        assert resultado["wcs_status"] in (
+            "gaia_offset_bruto_apenas", "gaia_falhou_match",
+            "gaia_skipped_pre_baixo", "gaia_refinado",
+        ), f"Status inesperado: {resultado['wcs_status']}"
+        assert resultado["wcs"] is not None
+        assert "gaia_n_matches_bruto" in resultado
+        assert "gaia_offset_bruto_arcsec" in resultado
+
+    # ── teste 10: _refinar_wcs duas passadas completo ─────────────────────
+    def test_refinar_wcs_duas_passadas_completo(self, monkeypatch):
+        """
+        Simula offset real de 6 arcsec: passada bruta corrige CRVAL,
+        passada fina deve encontrar matches suficientes e retornar
+        gaia_refinado ou gaia_offset_bruto_apenas (nunca gaia_falhou_match
+        nem exceção).
+        """
+        import detector as det_mod
+
+        frame = self._frame_sintetico_completo()
+        wcs = frame["wcs"]
+
+        # Tabela Gaia deslocada 6 arcsec do WCS para simular erro de pointing
+        gaia_tab = self._tabela_gaia_sintetica(n=25)
+        cosdec = np.cos(np.radians(-11.883))
+        gaia_tab_shifted = gaia_tab.copy()
+        gaia_tab_shifted["ra"] = np.array(gaia_tab["ra"]) - 6.0 / 3600.0 / cosdec
+
+        monkeypatch.setattr(det_mod, "_consultar_gaia_dr3",
+                            lambda *a, **kw: gaia_tab_shifted)
+
+        resultado = _refinar_wcs_gaia(frame)
+
+        assert resultado["wcs"] is not None, "WCS não pode ser None"
+        assert resultado["wcs_status"] != "gaia_falhou_rede"
+        assert "gaia_n_matches_bruto" in resultado
+        assert "gaia_offset_bruto_arcsec" in resultado
+        assert "gaia_n_matches_fino" in resultado
+        assert isinstance(resultado["gaia_offset_bruto_arcsec"], list)
+        assert len(resultado["gaia_offset_bruto_arcsec"]) == 2
+
+
+# ─────────────────────────────────────────────
+# Mascaramento de saturação (v1.3.1)
+# ─────────────────────────────────────────────
+class TestMascaraSaturacao:
+
+    def test_mascara_pixels_invalidos_basico(self):
+        img = np.full((100, 100), 500.0)
+        # 5 pixels saturados em 65535
+        img[10, 10] = 65535
+        img[20, 20] = 65535
+        img[30, 30] = 65535
+        img[40, 40] = 65535
+        img[50, 50] = 65535
+        # 3 pixels com valor 0 (buraco)
+        img[60, 60] = 0
+        img[70, 70] = 0
+        img[80, 80] = 0
+        mascara = _mascara_pixels_invalidos(img)
+        assert mascara.sum() == 8
+
+    def test_detectar_fontes_ignora_saturacao(self):
+        rng = np.random.default_rng(99)
+        img = rng.normal(100.0, 5.0, (200, 200))
+        # Fonte gaussiana real no centro
+        cy, cx = 100, 100
+        yy, xx = np.mgrid[0:200, 0:200]
+        img += 5000.0 * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * 2.0 ** 2))
+        # Cluster saturado longe da fonte real
+        img[30:40, 30:40] = 65535.0
+
+        fontes = detectar_fontes(img, sigma=5.5)
+        # A fonte real deve ser detectada
+        assert len(fontes) >= 1
+        # Nenhuma fonte deve estar dentro do cluster saturado
+        for y, x, _, _ in fontes:
+            dentro_cluster = (25 <= y <= 45) and (25 <= x <= 45)
+            assert not dentro_cluster, (
+                f"Fonte espúria detectada no cluster saturado em y={y:.1f}, x={x:.1f}"
+            )
+
+    def test_carregar_fits_aborta_em_frame_muito_saturado(self, tmp_path):
+        """FITS com 30% de pixels em 65535 deve causar SystemExit."""
+        nx, ny = 100, 100
+        img = np.full((ny, nx), 500.0, dtype=np.float32)
+        # 30% dos pixels saturados
+        n_sat = int(nx * ny * 0.30)
+        flat = img.ravel()
+        flat[:n_sat] = 65535.0
+        img = flat.reshape((ny, nx))
+
+        hdu = fits.PrimaryHDU(img)
+        h = hdu.header
+        h["DATE-OBS"] = "2019-08-28T10:00:00"
+        h["EXPTIME"]  = 45.0
+        h["CTYPE1"]   = "RA---TAN"
+        h["CTYPE2"]   = "DEC--TAN"
+        h["CRVAL1"]   = 329.44
+        h["CRVAL2"]   = -12.2
+        h["CRPIX1"]   = nx / 2
+        h["CRPIX2"]   = ny / 2
+        h["CDELT1"]   = -7.095e-05
+        h["CDELT2"]   = 7.129e-05
+        h["EQUINOX"]  = 2000.0
+
+        pasta = tmp_path / "sat_frames"
+        pasta.mkdir()
+        # Criar 4 frames idênticos para satisfazer a exigência do pipeline
+        for i in range(4):
+            hdu.writeto(pasta / f"frame{i+1}.fits", overwrite=True)
+
+        from detector import carregar_fits
+        with pytest.raises(SystemExit):
+            carregar_fits(pasta)

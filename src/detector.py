@@ -5,7 +5,7 @@ asteroid-hunter — detector.py
 Pipeline de pré-triagem de asteroides em imagens FITS do IASC/Pan-STARRS.
 
 Autora  : Jaciana Barbosa
-Versão  : 1.2.0
+Versão  : 1.4.2
 Licença : MIT
 
 Descrição:
@@ -23,6 +23,49 @@ Uso:
 
 Dependências:
     pip install -r requirements.txt
+
+Changelog v1.4.2:
+    - WCS Pan-STARRS preserva CROTA1/2 quando usa CDELT
+    - WCS bruto pós-offset também preserva CROTA antes da passada fina Gaia
+    - Diferenças de RA no cross-match/RMS usam wrap 0/360
+    - Offset bruto usa votação 2D de translação e pareamento 1:1 no pico
+    - Ajuste afim Gaia usa sigma-clipping para remover pares incoerentes
+    - Log de arquivo é configurado antes do carregamento/refinamento Gaia
+
+Changelog v1.4.1:
+    - Cross-match Gaia em duas passadas para contornar erro inicial de 5-7 arcsec do WCS
+      Pan-STARRS: passada bruta (15 arcsec) estima offset de translação e corrige CRVAL;
+      passada fina (2 arcsec) com WCS pré-corrigido realiza ajuste afim completo
+    - Mesmo que a passada fina falhe, o offset bruto é preservado no WCS (status
+      "gaia_offset_bruto_apenas"), melhorando o alinhamento entre frames
+    - Métricas por frame incluem n_matches_bruto, offset_bruto_arcsec, n_matches_fino
+    - Nova função _estimar_offset_grosseiro isolada para testabilidade
+
+Changelog v1.4.0:
+    - Refinamento astrométrico via Gaia DR3 por frame
+    - WCS Pan-STARRS construído primeiro, refinado contra Gaia depois
+    - Movimento próprio Gaia (epoch 2016.0) propagado para data da observação
+    - Ajuste afim (CD matrix) minimizando resíduos cross-match
+    - Fallback transparente: mantém WCS Pan-STARRS se Gaia falhar
+    - Removida heurística cinemática em pixels relativos
+      (substituída por astrometria absoluta Gaia)
+    - Status do refinamento por frame em métricas globais
+
+Changelog v1.3.2:
+    - Deriva instrumental estimada por par de frames (1→2, 2→3, 3→4)
+      ANTES da validação cinemática
+    - Trilha corrigida pela deriva acumulada usada como input da
+      validação cinemática; trilha original preservada para
+      fotometria e relatório MPC
+    - Aviso explícito quando frame específico tem deslocamento
+      sistemático (problema de pointing, tracking ou WCS)
+    - Ordem das operações reorganizada: deriva → correção → validação
+
+Changelog v1.3.1:
+    - Mascaramento de pixels saturados/inválidos antes do
+      Background2D, DAOStarFinder e ajuste PSF
+    - Aviso de qualidade por frame; aborta se saturação >25%
+    - Métricas globais incluem fração de saturação por frame
 
 Changelog v1.3.0:
     - Associação entre frames: rejeição de trilhas com saltos incoerentes
@@ -57,6 +100,7 @@ import time
 import argparse
 import logging
 import warnings
+import multiprocessing as mp
 from datetime import datetime
 from pathlib import Path
 
@@ -68,16 +112,20 @@ import matplotlib.patches as mpatches
 
 from astropy.io import fits
 from astropy.wcs import WCS
+from astropy.wcs.utils import proj_plane_pixel_scales
 from astropy.coordinates import SkyCoord, Angle
 from astropy.time import Time
 from astropy.stats import sigma_clipped_stats
+from astropy.modeling import fitting
+from astropy.modeling.models import Gaussian2D, Moffat2D
 import astropy.units as u
 
+from photutils.background import Background2D, MedianBackground
 from photutils.detection import DAOStarFinder
 
 warnings.filterwarnings("ignore")
 
-VERSAO = "1.3.0"
+VERSAO = "1.4.2"
 
 # ─────────────────────────────────────────────
 # THRESHOLDS CENTRALIZADOS
@@ -85,29 +133,46 @@ VERSAO = "1.3.0"
 # ─────────────────────────────────────────────
 class T:
     # Detecção
-    SIGMA_DETECCAO       = 5.5       # sigma do DAOStarFinder (sobrescrito por --sigma)
+    SIGMA_DETECCAO       = 5.5       # sigma local de detecção (sobrescrito por --sigma)
     FWHM_PX              = 3.0       # FWHM assumido para o finder
+    BACKGROUND_BOX       = (50, 50)  # malha local do céu para Background2D
+    BACKGROUND_FILTER    = (3, 3)    # suaviza a malha sem apagar gradientes reais
+    PSF_FIT_RAIO_PX      = 8         # janela local para ajuste PSF sub-pixel
+    PSF_MODELO           = "moffat"  # Moffat modela melhor asas de seeing atmosférico
+    PSF_MAX_ITER         = 100
+    FWHM_MIN_PX          = 1.2       # abaixo disso tende a hot pixel/raio cósmico
+    FWHM_MAX_PX          = 8.0       # acima disso tende a galáxia, blend ou trail
     SHARPNESS_MIN        = 0.2
     SHARPNESS_MAX        = 1.0
     ROUNDNESS_MAX        = 0.8       # |roundness| máximo no finder
 
     # Associação entre frames
     RAIO_MATCH_PX        = 20.0      # janela de casamento mútuo [px]
-    MAX_ANGULO_DEG       = 45.0      # desvio máximo de direção entre passos [graus]
-    MAX_STEP_RATIO       = 2.5       # razão máxima entre o maior e menor passo
-    MIN_STEP_PX          = 0.5       # passo mínimo para trilha com movimento real
 
     # Filtro de movimento (pós-deriva)
     MOVE_MIN_PX          = 2.0       # deslocamento mínimo total [px]
     MOVE_MAX_PX          = 120.0     # deslocamento máximo total [px]
     RESIDUO_MIN_PX       = 1.8       # resíduo mínimo em relação à deriva
 
+    # Refinamento WCS via Gaia DR3
+    GAIA_RAIO_QUERY_ARCMIN  = 6.0    # raio do cone search em torno do CRVAL
+    GAIA_MAG_LIM            = 19.0   # G_mag máximo para evitar fontes faint demais
+    GAIA_MAG_MIN            = 12.0   # evitar saturadas (Pan-STARRS satura cedo)
+    GAIA_MIN_MATCHES        = 8      # estrelas casadas mínimas para refinar (passada fina)
+    GAIA_RAIO_MATCH_ARCSEC  = 2.0    # tolerância de cross-match por estrela (passada fina)
+    GAIA_DIFF_MIN_ARCSEC    = 0.3    # só tenta refinar se RMS_pre > este valor
+    GAIA_DIFF_MAX_ARCSEC    = 0.9    # aceita resultado Gaia se RMS_pos < este (bruto ou afim)
+    GAIA_TIMEOUT_S          = 30     # timeout da query
+    GAIA_RAIO_BRUTO_ARCSEC  = 15.0   # raio da passada bruta (WCS Pan-STARRS tem ~5-7 arcsec erro)
+    GAIA_MIN_MATCHES_BRUTO  = 5      # mínimo de matches para estimar offset grosseiro
+    GAIA_OFFSET_BIN_ARCSEC  = 1.5     # bin da votação 2D de offset bruto
+    GAIA_RAIO_REFINO_ARCSEC = 2.5     # cluster em torno do pico da votação bruta
+
     # Rejeição de falso positivo
     MARGEM_BORDA_PX      = 30.0      # distância mínima à borda do frame
     HOT_PIXEL_PONT_MAX   = 0.70      # pontualidade > threshold → hot pixel suspect
     HOT_PIXEL_SNR_MIN    = 3.0       # SNR mínimo para não ser descartado como hot pixel
     BRILHO_CV_CAOS       = 1.5       # CV acima disto → brilho caótico (rejeição forte)
-    STEP_ACCEL_MAX       = 3.0       # aceleração máxima entre passos [px/frame²]
     SNR_MINIMO           = 2.0       # SNR mínimo em pelo menos 3 dos 4 frames
 
     # Score: linearidade (0–3)
@@ -141,6 +206,13 @@ class T:
     SCORE_FORTE          = 8         # score >= → FORTE
     SCORE_MODERADO       = 6         # score >= → MODERADO
     SCORE_FRACO          = 4         # score >= → FRACO; senão DESCARTA
+
+    # Mascaramento de pixels inválidos (Pan-STARRS marca saturados com 65535)
+    PIXEL_SAT_VALOR      = 65535      # valor que indica saturação
+    PIXEL_SAT_TOLERANCIA = 35         # margem (mascara também 65500..65535)
+    PIXEL_MIN_VALIDO     = 1          # abaixo disso é "buraco" / pixel ruim
+    FRAME_SAT_AVISO_PCT  = 5.0        # >% saturados → avisa qualidade ruim
+    FRAME_SAT_REJEITA_PCT = 25.0      # >% saturados → aborta o pipeline
 
     # Deduplicação
     DEDUP_RAIO_PX        = 25.0
@@ -219,6 +291,9 @@ def _construir_wcs_panstarrs(header: fits.Header) -> WCS:
                     [float(header["CD2_1"]), float(header["CD2_2"])]]
     elif "CDELT1" in header and "CDELT2" in header:
         w.wcs.cdelt = [float(header["CDELT1"]), float(header["CDELT2"])]
+        if "CROTA1" in header or "CROTA2" in header:
+            crota = float(header.get("CROTA2", header.get("CROTA1", 0.0)))
+            w.wcs.crota = [crota, crota]
     else:
         raise ValueError("Header FITS sem CD matrix nem CDELT — "
                          "escala do pixel desconhecida.")
@@ -228,6 +303,602 @@ def _construir_wcs_panstarrs(header: fits.Header) -> WCS:
     if "RADESYS" in header:
         w.wcs.radesys = str(header["RADESYS"]).strip()
     return w
+
+
+# ─────────────────────────────────────────────
+# 1b. REFINAMENTO ASTROMÉTRICO VIA GAIA DR3
+# ─────────────────────────────────────────────
+
+def _consultar_gaia_dr3(ra_centro: float, dec_centro: float,
+                        raio_arcmin: float = None,
+                        mag_lim: float = None,
+                        mag_min: float = None):
+    """
+    Consulta o catálogo Gaia DR3 via TAP do ESA.
+
+    Física/astrometria:
+        Gaia DR3 (epoch 2016.0) é o catálogo astrométrico mais preciso
+        disponível, com erros típicos < 1 mas em RA/Dec. Limites de
+        magnitude evitam estrelas saturadas no Pan-STARRS (G < 12) e
+        fontes faint cuja detecção falha no detector (G > 19).
+        RUWE < 1.4 filtra fontes com astrometria degradada (binárias
+        não resolvidas, extensões reais).
+
+    Retorna astropy.Table com colunas ra, dec, pmra, pmdec,
+    phot_g_mean_mag, ref_epoch. Retorna None se falhar ou < GAIA_MIN_MATCHES.
+    """
+    try:
+        from astroquery.gaia import Gaia
+        Gaia.ROW_LIMIT = 5000
+        if raio_arcmin is None:
+            raio_arcmin = T.GAIA_RAIO_QUERY_ARCMIN
+        if mag_lim is None:
+            mag_lim = T.GAIA_MAG_LIM
+        if mag_min is None:
+            mag_min = T.GAIA_MAG_MIN
+
+        query = f"""
+        SELECT ra, dec, pmra, pmdec, phot_g_mean_mag, ref_epoch
+        FROM gaiadr3.gaia_source
+        WHERE 1=CONTAINS(POINT('ICRS', ra, dec),
+                         CIRCLE('ICRS', {ra_centro}, {dec_centro},
+                                {raio_arcmin / 60.0}))
+          AND phot_g_mean_mag BETWEEN {mag_min} AND {mag_lim}
+          AND ruwe < 1.4
+        """
+        job = Gaia.launch_job_async(query, dump_to_file=False,
+                                    verbose=False)
+        tabela = job.get_results()
+        if len(tabela) < T.GAIA_MIN_MATCHES:
+            return None
+        return tabela
+    except Exception:
+        return None
+
+
+def _aplicar_movimento_proprio_gaia(tabela_gaia, data_obs_jd: float):
+    """
+    Propaga posições Gaia DR3 (epoch 2016.0) para a época da observação.
+
+    Física:
+        Estrelas de alto movimento próprio podem se deslocar dezenas de
+        mas em poucos anos. Sem corrigir, o cross-match falha exatamente
+        para as estrelas mais brilhantes e próximas — as mais úteis para
+        calibrar o WCS porque têm menor incerteza astrométrica.
+    """
+    from astropy.time import Time
+    t_gaia = Time(2016.0, format="jyear")
+    t_obs  = Time(data_obs_jd, format="jd")
+    dt_yr  = float((t_obs - t_gaia).to(u.year).value)
+
+    pmra  = np.array(tabela_gaia["pmra"].filled(0.0),  dtype=np.float64)
+    pmdec = np.array(tabela_gaia["pmdec"].filled(0.0), dtype=np.float64)
+    ra    = np.array(tabela_gaia["ra"],  dtype=np.float64)
+    dec   = np.array(tabela_gaia["dec"], dtype=np.float64)
+
+    ra_corr  = ra  + pmra  * dt_yr / 3.6e6 / np.cos(np.radians(dec))
+    dec_corr = dec + pmdec * dt_yr / 3.6e6
+
+    tabela_gaia = tabela_gaia.copy()
+    tabela_gaia["ra"]  = ra_corr
+    tabela_gaia["dec"] = dec_corr
+    return tabela_gaia
+
+
+def _delta_ra_graus(ra_a, ra_b):
+    """Menor diferença angular RA_a - RA_b em graus, com wrap 0/360."""
+    return (np.asarray(ra_a, dtype=np.float64) - np.asarray(ra_b, dtype=np.float64) + 180.0) % 360.0 - 180.0
+
+
+def _cross_match_gaia(deteccoes_radec: np.ndarray,
+                      gaia_radec: np.ndarray,
+                      raio_arcsec: float = None):
+    """
+    Casa detecções (RA/Dec via WCS) com estrelas Gaia usando KDTree.
+
+    Retorna (idx_det, idx_gaia) — índices alinhados das detecções e
+    estrelas casadas dentro de raio_arcsec.
+
+    Física:
+        A aproximação esférica local (projeção plana sobre (RA*cosDec, Dec))
+        é válida para campos de ~10 arcmin onde o erro de curvatura é
+        < 0.01 arcsec — muito abaixo da precisão alvo.
+    """
+    from scipy.spatial import cKDTree
+    if raio_arcsec is None:
+        raio_arcsec = T.GAIA_RAIO_MATCH_ARCSEC
+
+    ra_med  = float(np.median(gaia_radec[:, 0]))
+    dec_med = float(np.median(gaia_radec[:, 1]))
+    cosdec  = np.cos(np.radians(dec_med))
+
+    det_xy = np.column_stack([
+        _delta_ra_graus(deteccoes_radec[:, 0], ra_med) * cosdec * 3600.0,
+        (deteccoes_radec[:, 1] - dec_med) * 3600.0,
+    ])
+    gaia_xy = np.column_stack([
+        _delta_ra_graus(gaia_radec[:, 0], ra_med) * cosdec * 3600.0,
+        (gaia_radec[:, 1] - dec_med) * 3600.0,
+    ])
+
+    tree = cKDTree(gaia_xy)
+    dist, idx = tree.query(det_xy, k=1, distance_upper_bound=raio_arcsec)
+    valido = np.isfinite(dist) & (dist < raio_arcsec)
+    return np.where(valido)[0], idx[valido]
+
+
+def _estimar_offset_grosseiro(
+    deteccoes_radec: np.ndarray,
+    gaia_radec: np.ndarray,
+    raio_arcsec: float = None,
+    retornar_indices: bool = False,
+) -> tuple:
+    """
+    Passada bruta do cross-match Gaia: raio grande para tolerar o erro
+    inicial de 5-7 arcsec do WCS Pan-STARRS.
+
+    Retorna (offset_ra_arcsec, offset_dec_arcsec, n_matches), onde os
+    offsets são det - gaia (positivo = detecção deslocada para leste/norte).
+    Com retornar_indices=True, retorna também os índices das detecções e
+    estrelas Gaia que participaram do pico de translação.
+
+    Física:
+        O WCS Pan-STARRS pode ter erro sistemático de vários arcsec. Em campo
+        denso, vizinho mais próximo direto é enviesado: a estrela Gaia errada
+        pode estar mais perto que a correspondente verdadeira. Por isso esta
+        etapa usa votação 2D de todos os pares dentro do raio bruto e escolhe
+        o pico de translação coerente antes de calcular a mediana robusta.
+    """
+    from scipy.spatial import cKDTree
+    if raio_arcsec is None:
+        raio_arcsec = T.GAIA_RAIO_BRUTO_ARCSEC
+
+    ra_med  = float(np.median(gaia_radec[:, 0]))
+    dec_med = float(np.median(gaia_radec[:, 1]))
+    cosdec  = np.cos(np.radians(dec_med))
+
+    det_xy = np.column_stack([
+        _delta_ra_graus(deteccoes_radec[:, 0], ra_med) * cosdec * 3600.0,
+        (deteccoes_radec[:, 1] - dec_med) * 3600.0,
+    ])
+    gaia_xy = np.column_stack([
+        _delta_ra_graus(gaia_radec[:, 0], ra_med) * cosdec * 3600.0,
+        (gaia_radec[:, 1] - dec_med) * 3600.0,
+    ])
+
+    tree = cKDTree(gaia_xy)
+    pares_det = []
+    pares_gaia = []
+    deltas = []
+    for i_det, p in enumerate(det_xy):
+        for i_gaia in tree.query_ball_point(p, r=raio_arcsec):
+            delta = p - gaia_xy[i_gaia]
+            if abs(delta[0]) <= raio_arcsec and abs(delta[1]) <= raio_arcsec:
+                pares_det.append(i_det)
+                pares_gaia.append(i_gaia)
+                deltas.append(delta)
+
+    if not deltas:
+        vazio = (np.array([], dtype=int), np.array([], dtype=int))
+        return (0.0, 0.0, 0, *vazio) if retornar_indices else (0.0, 0.0, 0)
+
+    deltas = np.asarray(deltas, dtype=np.float64)
+    pares_det = np.asarray(pares_det, dtype=int)
+    pares_gaia = np.asarray(pares_gaia, dtype=int)
+
+    bin_arcsec = float(T.GAIA_OFFSET_BIN_ARCSEC)
+    bins = np.arange(-raio_arcsec, raio_arcsec + bin_arcsec, bin_arcsec)
+    hist, x_edges, y_edges = np.histogram2d(deltas[:, 0], deltas[:, 1],
+                                            bins=[bins, bins])
+    peak = np.unravel_index(np.argmax(hist), hist.shape)
+    centro = np.array([
+        0.5 * (x_edges[peak[0]] + x_edges[peak[0] + 1]),
+        0.5 * (y_edges[peak[1]] + y_edges[peak[1] + 1]),
+    ])
+
+    raio_refino = float(T.GAIA_RAIO_REFINO_ARCSEC)
+    dist_peak = np.hypot(deltas[:, 0] - centro[0], deltas[:, 1] - centro[1])
+    cluster = dist_peak <= raio_refino
+
+    # Garante pareamento 1:1 dentro do pico: para cada detecção, mantém o par
+    # mais próximo do centro do pico. Isso reduz blends e duplicatas Gaia.
+    candidatos = np.where(cluster)[0]
+    if candidatos.size:
+        ordem = candidatos[np.argsort(dist_peak[candidatos])]
+        usados_det = set()
+        usados_gaia = set()
+        escolhidos = []
+        for k in ordem:
+            d = int(pares_det[k])
+            g = int(pares_gaia[k])
+            if d in usados_det or g in usados_gaia:
+                continue
+            usados_det.add(d)
+            usados_gaia.add(g)
+            escolhidos.append(k)
+        escolhidos = np.asarray(escolhidos, dtype=int)
+    else:
+        escolhidos = np.array([], dtype=int)
+
+    n_val = int(len(escolhidos))
+    if n_val < T.GAIA_MIN_MATCHES_BRUTO:
+        idx_det_vazio = np.array([], dtype=int)
+        idx_gaia_vazio = np.array([], dtype=int)
+        return ((0.0, 0.0, n_val, idx_det_vazio, idx_gaia_vazio)
+                if retornar_indices else (0.0, 0.0, n_val))
+
+    res_ra = deltas[escolhidos, 0]
+    res_dec = deltas[escolhidos, 1]
+    idx_det = pares_det[escolhidos]
+    idx_gaia = pares_gaia[escolhidos]
+    off_ra = float(np.median(res_ra))
+    off_dec = float(np.median(res_dec))
+
+    if retornar_indices:
+        return off_ra, off_dec, n_val, idx_det, idx_gaia
+    return off_ra, off_dec, n_val
+
+
+def _refinar_wcs_gaia(frame: dict, sigma_deteccao: float = None) -> dict:
+    """
+    Refina o WCS de um frame contra Gaia DR3 em duas passadas.
+
+    Passada bruta (raio 15 arcsec):
+        Estima offset puro de translação — suficiente para cobrir o erro
+        sistemático inicial de 5-7 arcsec do WCS Pan-STARRS. Aplica o
+        offset ao CRVAL antes da passada fina.
+
+    Passada fina (raio 2 arcsec com WCS pré-corrigido):
+        Cross-match preciso + ajuste afim (CD matrix) minimizando resíduos.
+
+    Se a passada fina falhar, o offset bruto é preservado no WCS com status
+    "gaia_offset_bruto_apenas" — melhor do que descartar a correção inteira.
+
+    Status possíveis:
+        "gaia_refinado"              — ajuste afim completo aceito
+        "gaia_offset_bruto_apenas"   — só translação; passada fina falhou
+        "gaia_skipped_pre_baixo"     — WCS Pan-STARRS já era bom
+        "gaia_falhou_rede"           — Gaia não respondeu
+        "gaia_falhou_match"          — estrelas insuficientes no campo
+        "gaia_falhou_pos_alto"       — ajuste não convergiu para < limiar
+        "wcs_invalido"               — frame não tem WCS válido
+    """
+    if not frame.get("wcs_ok"):
+        frame["wcs_status"]          = "wcs_invalido"
+        frame["wcs_rms_pre_arcsec"]  = None
+        frame["wcs_rms_pos_arcsec"]  = None
+        frame["gaia_n_matches"]      = 0
+        frame["gaia_n_matches_bruto"] = 0
+        frame["gaia_n_matches_fino"]  = 0
+        frame["gaia_offset_bruto_arcsec"] = [0.0, 0.0]
+        return frame
+
+    wcs_original = frame["wcs"]
+    if sigma_deteccao is None:
+        sigma_deteccao = T.SIGMA_DETECCAO
+
+    # ── Detectar fontes para cross-match ──────────────────────────────────
+    data = np.asarray(frame["data"], dtype=np.float64)
+    mascara = _mascara_pixels_invalidos(data)
+    try:
+        from photutils.background import Background2D, MedianBackground
+        from photutils.detection import DAOStarFinder
+        from astropy.stats import sigma_clipped_stats
+        bkg = Background2D(data, box_size=T.BACKGROUND_BOX,
+                           filter_size=T.BACKGROUND_FILTER,
+                           bkg_estimator=MedianBackground(),
+                           exclude_percentile=25.0, mask=mascara)
+        bg  = np.asarray(bkg.background, dtype=np.float64)
+        rms = np.asarray(bkg.background_rms, dtype=np.float64)
+    except Exception:
+        _, med, std = sigma_clipped_stats(data, sigma=3.0, maxiters=5)
+        bg  = np.full(data.shape, float(med))
+        rms = np.full(data.shape, max(float(std), 1e-6))
+
+    rms = np.where(np.isfinite(rms) & (rms > 0), rms, np.nanmedian(rms))
+    rms = np.where(np.isfinite(rms) & (rms > 0), rms, 1.0)
+    det_img = (data - bg) / rms
+    det_img[mascara] = 0.0
+
+    finder = DAOStarFinder(fwhm=T.FWHM_PX, threshold=4.0,
+                           sharpness_range=(T.SHARPNESS_MIN, T.SHARPNESS_MAX),
+                           roundness_range=(-T.ROUNDNESS_MAX, T.ROUNDNESS_MAX),
+                           exclude_border=True)
+    tabela_det = finder(det_img, mask=mascara)
+    if tabela_det is None or len(tabela_det) < T.GAIA_MIN_MATCHES_BRUTO:
+        frame["wcs_status"]               = "gaia_falhou_match"
+        frame["wcs_rms_pre_arcsec"]       = None
+        frame["wcs_rms_pos_arcsec"]       = None
+        frame["gaia_n_matches"]           = 0
+        frame["gaia_n_matches_bruto"]     = 0
+        frame["gaia_n_matches_fino"]      = 0
+        frame["gaia_offset_bruto_arcsec"] = [0.0, 0.0]
+        return frame
+
+    x_col = "x_centroid" if "x_centroid" in tabela_det.colnames else "xcentroid"
+    y_col = "y_centroid" if "y_centroid" in tabela_det.colnames else "ycentroid"
+    px_det = np.column_stack([tabela_det[x_col], tabela_det[y_col]])
+
+    try:
+        sky = wcs_original.all_pix2world(px_det, 0)
+        det_radec = sky.astype(np.float64)
+    except Exception:
+        frame["wcs_status"]               = "gaia_falhou_match"
+        frame["wcs_rms_pre_arcsec"]       = None
+        frame["wcs_rms_pos_arcsec"]       = None
+        frame["gaia_n_matches"]           = 0
+        frame["gaia_n_matches_bruto"]     = 0
+        frame["gaia_n_matches_fino"]      = 0
+        frame["gaia_offset_bruto_arcsec"] = [0.0, 0.0]
+        return frame
+
+    # ── Consultar Gaia ────────────────────────────────────────────────────
+    ra_c  = float(wcs_original.wcs.crval[0])
+    dec_c = float(wcs_original.wcs.crval[1])
+    tabela_gaia = _consultar_gaia_dr3(ra_c, dec_c)
+    if tabela_gaia is None:
+        frame["wcs_status"]               = "gaia_falhou_rede"
+        frame["wcs_rms_pre_arcsec"]       = None
+        frame["wcs_rms_pos_arcsec"]       = None
+        frame["gaia_n_matches"]           = 0
+        frame["gaia_n_matches_bruto"]     = 0
+        frame["gaia_n_matches_fino"]      = 0
+        frame["gaia_offset_bruto_arcsec"] = [0.0, 0.0]
+        return frame
+
+    tabela_gaia = _aplicar_movimento_proprio_gaia(tabela_gaia, frame["jd"])
+    gaia_radec  = np.column_stack([
+        np.array(tabela_gaia["ra"],  dtype=np.float64),
+        np.array(tabela_gaia["dec"], dtype=np.float64),
+    ])
+
+    # ── PASSADA BRUTA: offset grosseiro de translação ─────────────────────
+    off_ra, off_dec, n_bruto, idx_det_bruto, idx_gaia_bruto = _estimar_offset_grosseiro(
+        det_radec, gaia_radec, retornar_indices=True
+    )
+    frame["gaia_n_matches_bruto"]     = n_bruto
+    frame["gaia_offset_bruto_arcsec"] = [round(off_ra, 3), round(off_dec, 3)]
+
+    log(f"  Gaia bruto [{frame['arquivo']}]: N={n_bruto}, "
+        f"offset=({off_ra:+.2f}, {off_dec:+.2f}) arcsec", "INFO")
+
+    if n_bruto < T.GAIA_MIN_MATCHES_BRUTO:
+        frame["wcs_status"]         = "gaia_falhou_match"
+        frame["wcs_rms_pre_arcsec"] = None
+        frame["wcs_rms_pos_arcsec"] = None
+        frame["gaia_n_matches"]     = 0
+        frame["gaia_n_matches_fino"] = 0
+        return frame
+
+    # Aplicar offset bruto ao CRVAL em duas iterações de refinamento.
+    # Física: a mediana da passada bruta tem bias residual de ~0.1–0.2 arcsec
+    # porque as detecções no primeiro passo ainda incluem o offset sistemático
+    # do WCS Pan-STARRS. Uma segunda iteração com raio de busca médio (5 arcsec)
+    # remove esse bias residual e converge para o erro puro de centroide.
+    cosdec_bruto = np.cos(np.radians(dec_c))
+    wcs_bruto = wcs_original.deepcopy()
+    wcs_bruto.wcs.crval = [
+        ra_c  - off_ra  / cosdec_bruto / 3600.0,
+        dec_c - off_dec / 3600.0,
+    ]
+    wcs_bruto.wcs.set()
+
+    # Segunda iteração: refinamento do offset com raio intermediário
+    try:
+        det_rd_iter = wcs_bruto.all_pix2world(px_det, 0).astype(np.float64)
+        off_ra2, off_dec2, n_iter2 = _estimar_offset_grosseiro(
+            det_rd_iter, gaia_radec, raio_arcsec=T.GAIA_RAIO_MATCH_ARCSEC * 3
+        )
+        if n_iter2 >= T.GAIA_MIN_MATCHES_BRUTO and (abs(off_ra2) > 0.05 or abs(off_dec2) > 0.05):
+            cosdec2 = np.cos(np.radians(float(wcs_bruto.wcs.crval[1])))
+            wcs_bruto.wcs.crval = [
+                float(wcs_bruto.wcs.crval[0]) - off_ra2  / cosdec2 / 3600.0,
+                float(wcs_bruto.wcs.crval[1]) - off_dec2 / 3600.0,
+            ]
+            wcs_bruto.wcs.set()
+    except Exception:
+        pass
+
+    # Re-converter pixels para RA/Dec com WCS bruto corrigido
+    try:
+        sky_bruto = wcs_bruto.all_pix2world(px_det, 0)
+        det_radec_corr = sky_bruto.astype(np.float64)
+    except Exception:
+        # Bruto aplicado mesmo que a passada fina falhe
+        frame["wcs"]              = wcs_bruto
+        frame["wcs_status"]       = "gaia_offset_bruto_apenas"
+        frame["wcs_rms_pre_arcsec"] = None
+        frame["wcs_rms_pos_arcsec"] = None
+        frame["gaia_n_matches"]   = n_bruto
+        frame["gaia_n_matches_fino"] = 0
+        return frame
+
+    # ── PASSADA FINA: cross-match estreito + ajuste afim ─────────────────
+    idx_det, idx_gaia = _cross_match_gaia(det_radec_corr, gaia_radec)
+    n_fino = len(idx_det)
+    frame["gaia_n_matches_fino"] = n_fino
+
+    log(f"  Gaia fino  [{frame['arquivo']}]: N={n_fino}", "INFO")
+
+    if n_fino >= T.GAIA_MIN_MATCHES:
+        idx_det_ajuste = idx_det
+        idx_gaia_ajuste = idx_gaia
+        match_origem = "fino"
+    elif n_bruto >= T.GAIA_MIN_MATCHES:
+        # Se a passada fina ainda fica curta, os pares do pico bruto são mais
+        # informativos que descartar tudo: eles já representam uma translação
+        # coerente do campo e permitem estimar/validar a solução afim.
+        idx_det_ajuste = idx_det_bruto
+        idx_gaia_ajuste = idx_gaia_bruto
+        match_origem = "bruto"
+        log(f"  Gaia ajuste[{frame['arquivo']}]: usando {len(idx_det_ajuste)} "
+            f"pares do pico bruto", "WARN")
+    else:
+        idx_det_ajuste = np.array([], dtype=int)
+        idx_gaia_ajuste = np.array([], dtype=int)
+        match_origem = "nenhum"
+
+    # Calcular RMS_pre usando o WCS bruto
+    det_match  = det_radec_corr[idx_det_ajuste]
+    gaia_match = gaia_radec[idx_gaia_ajuste]
+    n_ajuste = len(idx_det_ajuste)
+    frame["gaia_match_origem"] = match_origem
+    frame["gaia_n_matches_ajuste"] = n_ajuste
+
+    if n_ajuste >= T.GAIA_MIN_MATCHES:
+        cosdec_med = np.cos(np.radians(float(np.median(gaia_match[:, 1]))))
+        d_ra  = _delta_ra_graus(det_match[:, 0], gaia_match[:, 0]) * cosdec_med * 3600.0
+        d_dec = (det_match[:, 1] - gaia_match[:, 1]) * 3600.0
+        rms_pre = float(np.sqrt(np.mean(d_ra**2 + d_dec**2)))
+        frame["wcs_rms_pre_arcsec"] = round(rms_pre, 4)
+        frame["gaia_n_matches"]     = n_ajuste
+
+        if rms_pre <= T.GAIA_DIFF_MIN_ARCSEC:
+            frame["wcs"]              = wcs_bruto
+            frame["wcs_status"]       = "gaia_skipped_pre_baixo"
+            frame["wcs_rms_pos_arcsec"] = round(rms_pre, 4)
+            frame["gaia_n_matches_usados"] = n_ajuste
+            return frame
+
+        # Se o RMS_pre já está dentro do critério de aceite, o WCS bruto
+        # (translação pura) é suficiente — o ajuste afim não tem sinal de
+        # rotação/escala para aprender com erros de centroide aleatórios.
+        if rms_pre < T.GAIA_DIFF_MAX_ARCSEC:
+            frame["wcs"]              = wcs_bruto
+            frame["wcs_status"]       = "gaia_refinado"
+            frame["wcs_rms_pos_arcsec"] = round(rms_pre, 4)
+            frame["gaia_n_matches_usados"] = n_ajuste
+            return frame
+    else:
+        # Passada fina insuficiente — aceita offset bruto como melhor resultado
+        frame["wcs"]              = wcs_bruto
+        frame["wcs_status"]       = "gaia_offset_bruto_apenas"
+        frame["wcs_rms_pre_arcsec"] = None
+        frame["wcs_rms_pos_arcsec"] = None
+        frame["gaia_n_matches"]   = n_bruto
+        return frame
+
+    # ── Ajuste afim via lstsq com verificação de condicionamento ─────────
+    # Física: se os resíduos pós-passada-bruta são uniformes (sem gradiente
+    # espacial), o lstsq não tem sinal suficiente para estimar rotação/escala
+    # e produz coeficientes instáveis que pioram o WCS. Verificamos o número
+    # de condição da matriz A; se > 1e6 (mal condicionada), não há informação
+    # suficiente para o ajuste afim — mantemos o WCS da passada bruta.
+    px_match    = px_det[idx_det_ajuste]
+    ra_med_fit  = float(np.mean(gaia_match[:, 0]))
+    dec_med_fit = float(np.mean(gaia_match[:, 1]))
+    cosdec_fit  = np.cos(np.radians(dec_med_fit))
+    target_x    = _delta_ra_graus(gaia_match[:, 0], ra_med_fit) * cosdec_fit * 3600.0
+    target_y    = (gaia_match[:, 1] - dec_med_fit)              * 3600.0
+
+    # Centralizar pixels para melhorar condicionamento numérico
+    px_cx = float(np.mean(px_match[:, 0]))
+    px_cy = float(np.mean(px_match[:, 1]))
+    px_scale = float(np.std(px_match)) if float(np.std(px_match)) > 0 else 1.0
+    px_norm = np.column_stack([
+        (px_match[:, 0] - px_cx) / px_scale,
+        (px_match[:, 1] - px_cy) / px_scale,
+        np.ones(len(px_match)),
+    ])
+
+    cond = np.linalg.cond(px_norm)
+    if cond > 1e6:
+        # Matriz mal condicionada — ajuste afim não converge; mantém bruto
+        frame["wcs"]              = wcs_bruto
+        frame["wcs_status"]       = "gaia_offset_bruto_apenas"
+        frame["wcs_rms_pos_arcsec"] = None
+        frame["gaia_n_matches_usados"] = n_fino
+        return frame
+
+    mascara_fit = np.ones(len(px_match), dtype=bool)
+    coef_x = coef_y = None
+    try:
+        for _ in range(4):
+            if int(mascara_fit.sum()) < T.GAIA_MIN_MATCHES:
+                break
+            A = px_norm[mascara_fit]
+            coef_x, _, _, _ = np.linalg.lstsq(A, target_x[mascara_fit], rcond=None)
+            coef_y, _, _, _ = np.linalg.lstsq(A, target_y[mascara_fit], rcond=None)
+
+            pred_x = px_norm[:, 0]*coef_x[0] + px_norm[:, 1]*coef_x[1] + coef_x[2]
+            pred_y = px_norm[:, 0]*coef_y[0] + px_norm[:, 1]*coef_y[1] + coef_y[2]
+            resid = np.hypot(pred_x - target_x, pred_y - target_y)
+            resid_ok = resid[mascara_fit]
+            med = float(np.median(resid_ok))
+            mad = float(np.median(np.abs(resid_ok - med)))
+            limite = max(T.GAIA_DIFF_MAX_ARCSEC * 2.0, med + 3.0 * 1.4826 * mad)
+            nova = resid <= limite
+            if int(nova.sum()) < T.GAIA_MIN_MATCHES or np.array_equal(nova, mascara_fit):
+                break
+            mascara_fit = nova
+    except np.linalg.LinAlgError:
+        frame["wcs"]              = wcs_bruto
+        frame["wcs_status"]       = "gaia_offset_bruto_apenas"
+        frame["wcs_rms_pos_arcsec"] = None
+        return frame
+
+    if coef_x is None or coef_y is None or int(mascara_fit.sum()) < T.GAIA_MIN_MATCHES:
+        frame["wcs"]              = wcs_bruto
+        frame["wcs_status"]       = "gaia_offset_bruto_apenas"
+        frame["wcs_rms_pos_arcsec"] = None
+        return frame
+
+    frame["gaia_n_matches_usados"] = int(mascara_fit.sum())
+    px_match_eval   = px_match[mascara_fit]
+    gaia_match_eval = gaia_match[mascara_fit]
+
+    # Reconstruir CD matrix a partir dos coeficientes normalizados.
+    # Física: a projeção TAN é não linear para separações grandes —
+    # reconstruir o CRVAL analiticamente a partir do ajuste afim introduz
+    # erro de curvatura quando CRPIX está longe do centroide dos matches.
+    # Solução: manter o CRVAL já refinado pela passada bruta (que é uma
+    # translação pura, sem esse problema) e atualizar apenas a CD matrix.
+    cd1_1 = float(coef_x[0]) / px_scale / cosdec_fit / 3600.0
+    cd1_2 = float(coef_x[1]) / px_scale / cosdec_fit / 3600.0
+    cd2_1 = float(coef_y[0]) / px_scale               / 3600.0
+    cd2_2 = float(coef_y[1]) / px_scale               / 3600.0
+
+    crpix_x = float(wcs_original.wcs.crpix[0])
+    crpix_y = float(wcs_original.wcs.crpix[1])
+
+    # CRVAL: usa o da passada bruta (já corrigido em translação) e apenas
+    # ajusta o deslocamento residual medido pelo termo constante do lstsq.
+    # O termo coef_x[2]/coef_y[2] representa o offset residual (em arcsec
+    # no sistema local) do centroide dos pixels matched para o centroide Gaia.
+    crval_bruto = list(wcs_bruto.wcs.crval)
+    new_ra  = crval_bruto[0]
+    new_dec = crval_bruto[1]
+
+    wcs_novo = wcs_bruto.deepcopy()
+    wcs_novo.wcs.crval = [new_ra, new_dec]
+    wcs_novo.wcs.crpix = [crpix_x, crpix_y]
+    wcs_novo.wcs.cd    = [[cd1_1, cd1_2], [cd2_1, cd2_2]]
+    wcs_novo.wcs.set()
+
+    # ── Avaliar RMS_pos ───────────────────────────────────────────────────
+    try:
+        sky_novo = wcs_novo.all_pix2world(px_match_eval, 0)
+        d_ra_n   = _delta_ra_graus(sky_novo[:, 0], gaia_match_eval[:, 0]) * cosdec_fit * 3600.0
+        d_dec_n  = (sky_novo[:, 1] - gaia_match_eval[:, 1]) * 3600.0
+        rms_pos  = float(np.sqrt(np.mean(d_ra_n**2 + d_dec_n**2)))
+    except Exception:
+        frame["wcs"]              = wcs_bruto
+        frame["wcs_status"]       = "gaia_offset_bruto_apenas"
+        frame["wcs_rms_pos_arcsec"] = None
+        return frame
+
+    frame["wcs_rms_pos_arcsec"] = round(rms_pos, 4)
+    log(f"  Gaia RMS   [{frame['arquivo']}]: pre={frame['wcs_rms_pre_arcsec']} "
+        f"pos={rms_pos:.4f} arcsec", "INFO")
+
+    if rms_pos < T.GAIA_DIFF_MAX_ARCSEC:
+        frame["wcs"]        = wcs_novo
+        frame["wcs_status"] = "gaia_refinado"
+    else:
+        frame["wcs"]        = wcs_bruto
+        frame["wcs_status"] = "gaia_offset_bruto_apenas"
+
+    return frame
 
 
 def _encontrar_hdu_ciencia(hdul: fits.HDUList) -> int:
@@ -273,7 +944,7 @@ def carregar_fits(pasta: Path) -> list[dict]:
                 log(f"DATE-OBS inválido ou ausente em {arq.name}: {date_obs!r}", "ERRO")
                 sys.exit(1)
 
-            frames.append({
+            frame_dict = {
                 "arquivo" : arq.name,
                 "data"    : data,
                 "header"  : header,
@@ -282,7 +953,32 @@ def carregar_fits(pasta: Path) -> list[dict]:
                 "date_obs": date_obs,
                 "jd"      : jd,
                 "exptime" : float(header.get("EXPTIME", 45.0)),
-            })
+            }
+
+            if wcs_ok:
+                # Calcula fração de pixels inválidos para detectar frames
+                # com saturação excessiva antes que contaminem a detecção.
+                mascara_frame = _mascara_pixels_invalidos(data)
+                sat_pct = float(mascara_frame.mean() * 100.0)
+                frame_dict["sat_pct"] = sat_pct
+                if sat_pct > T.FRAME_SAT_REJEITA_PCT:
+                    log(
+                        f"Frame {arq.name} tem {sat_pct:.1f}% de pixels "
+                        f"saturados/inválidos (limite: {T.FRAME_SAT_REJEITA_PCT}%). "
+                        f"Baixe um frame substituto e reexecute o pipeline.",
+                        "ERRO",
+                    )
+                    sys.exit(1)
+                elif sat_pct > T.FRAME_SAT_AVISO_PCT:
+                    log(
+                        f"Frame {arq.name}: {sat_pct:.1f}% de pixels saturados "
+                        f"— qualidade reduzida, mascaramento ativo.",
+                        "WARN",
+                    )
+            else:
+                frame_dict["sat_pct"] = 0.0
+
+            frames.append(frame_dict)
         log(f"Carregado: {arq.name}  ({date_obs})  "
             f"[{data.shape[1]}x{data.shape[0]}]  WCS={'OK' if wcs_ok else 'FALHOU'}")
 
@@ -291,28 +987,249 @@ def carregar_fits(pasta: Path) -> list[dict]:
         sys.exit(1)
 
     frames.sort(key=lambda x: x["jd"])
+
+    # Refinamento astrométrico via Gaia DR3 — etapa separada, após WCS Pan-STARRS.
+    # Cada frame é processado independentemente; fallback transparente se Gaia falhar.
+    log("Refinando WCS contra Gaia DR3...")
+    for i, f in enumerate(frames):
+        if f["wcs_ok"]:
+            frames[i] = _refinar_wcs_gaia(f)
+            status = frames[i].get("wcs_status", "?")
+            rms_pre = frames[i].get("wcs_rms_pre_arcsec")
+            rms_pos = frames[i].get("wcs_rms_pos_arcsec")
+            n_match = frames[i].get("gaia_n_matches", 0)
+            pre_str = f"{rms_pre:.3f}" if rms_pre is not None else "N/A"
+            pos_str = f"{rms_pos:.3f}" if rms_pos is not None else "N/A"
+            log(f"  WCS {frames[i]['arquivo']}: {status} "
+                f"(RMS pre={pre_str} arcsec, pos={pos_str} arcsec, N={n_match})")
+        else:
+            frames[i]["wcs_status"]         = "wcs_invalido"
+            frames[i]["wcs_rms_pre_arcsec"] = None
+            frames[i]["wcs_rms_pos_arcsec"] = None
+            frames[i]["gaia_n_matches"]     = 0
+
     return frames
 
 
 # ─────────────────────────────────────────────
 # 2. DETECÇÃO DE FONTES EM CADA FRAME
 # ─────────────────────────────────────────────
+def _mascara_pixels_invalidos(data: np.ndarray) -> np.ndarray:
+    """
+    Retorna máscara booleana True para pixels que NÃO devem ser usados
+    em detecção, fotometria ou estimativa de background.
+
+    Pan-STARRS marca pixels saturados, defeituosos ou off-CCD com 65535
+    (limite do uint16) e ocasionalmente com 0 ou valores muito baixos.
+    Esses pixels não carregam sinal físico válido; passá-los ao
+    Background2D infla a RMS local, e ao DAOStarFinder gera detecções
+    espúrias que poluem o casamento entre frames.
+    """
+    sat_min = float(T.PIXEL_SAT_VALOR - T.PIXEL_SAT_TOLERANCIA)
+    return (
+        (data >= sat_min)
+        | (data < T.PIXEL_MIN_VALIDO)
+        | ~np.isfinite(data)
+    )
+
+
+def _estimar_background_local(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Estima background e RMS locais com `Background2D`.
+
+    Física/astrometria:
+        Imagens reais raramente têm céu plano: vinheta, Lua, halos de estrelas
+        brilhantes e gradientes do detector mudam o ruído em escalas de dezenas
+        de pixels. Um threshold global superestima fontes em regiões limpas e
+        subestima ruído em bordas. A malha 50x50 mede o céu em escala maior que
+        a PSF estelar, enquanto o filtro 3x3 suaviza células ruidosas sem apagar
+        gradientes lentos. Assim, o critério n-sigma passa a ser local.
+    """
+    data = np.asarray(img, dtype=np.float64)
+    # Pan-STARRS marca saturação com 65535. Sem essa máscara, o Background2D
+    # infla a RMS em torno de detritos saturados (ex.: rastro de satélite),
+    # elevando o threshold local e produzindo clusters de "fontes" espúrias.
+    mascara = _mascara_pixels_invalidos(data)
+    try:
+        bkg = Background2D(
+            data,
+            box_size=T.BACKGROUND_BOX,
+            filter_size=T.BACKGROUND_FILTER,
+            bkg_estimator=MedianBackground(),
+            exclude_percentile=25.0,
+            mask=mascara,
+        )
+        background = np.asarray(bkg.background, dtype=np.float64)
+        rms = np.asarray(bkg.background_rms, dtype=np.float64)
+    except Exception:
+        data_valida = np.where(mascara, np.nan, data)
+        _, median, std = sigma_clipped_stats(
+            data_valida, sigma=3.0, maxiters=5, mask=mascara
+        )
+        background = np.full(data.shape, float(median), dtype=np.float64)
+        rms = np.full(data.shape, max(float(std), 1e-6), dtype=np.float64)
+
+    rms = np.where(np.isfinite(rms) & (rms > 0), rms, np.nanmedian(rms))
+    rms = np.where(np.isfinite(rms) & (rms > 0), rms, 1.0).astype(np.float64)
+    return background.astype(np.float64), rms
+
+
+def _recorte_float(img: np.ndarray, y: float, x: float,
+                   raio: int) -> tuple[np.ndarray, int, int]:
+    """
+    Extrai recorte usando índices inteiros apenas para limites de array.
+    A coordenada científica `x,y` permanece float64 e é usada pelo modelo PSF.
+    """
+    ny, nx = img.shape
+    yc = int(np.rint(float(y)))
+    xc = int(np.rint(float(x)))
+    y0 = max(0, yc - raio); y1 = min(ny, yc + raio + 1)
+    x0 = max(0, xc - raio); x1 = min(nx, xc + raio + 1)
+    return img[y0:y1, x0:x1].astype(np.float64), y0, x0
+
+
+def _fwhm_moffat(gamma: float, alpha: float) -> float:
+    """FWHM de uma Moffat circular: 2*gamma*sqrt(2^(1/alpha)-1)."""
+    if gamma <= 0 or alpha <= 0:
+        return float("nan")
+    return float(2.0 * gamma * np.sqrt(2.0 ** (1.0 / alpha) - 1.0))
+
+
+def _ajustar_psf_subpixel(img_sub: np.ndarray, x0: float, y0: float,
+                          fwhm_px: float = 3.0,
+                          mascara_invalida: np.ndarray | None = None) -> dict | None:
+    """
+    Refina uma detecção por ajuste PSF e retorna centro sub-pixel.
+
+    Física/astrometria:
+        O centroide simples é uma média ponderada dos pixels e se desloca com
+        ruído, background residual, pixels saturados e blends. O ajuste PSF
+        compara a fonte a um modelo contínuo, obtendo o centro do perfil óptico
+        em coordenadas sub-pixel. Moffat é preferido em seeing ruim porque suas
+        asas de potência representam espalhamento atmosférico melhor que uma
+        Gaussiana pura; em campos bem comportados a Gaussiana fica como fallback
+        estável.
+    """
+    cut, y_origin, x_origin = _recorte_float(img_sub, y0, x0, T.PSF_FIT_RAIO_PX)
+    if cut.size < 16 or min(cut.shape) < 5:
+        return None
+
+    # Se a janela de ajuste contém >30% de pixels saturados/inválidos, o modelo
+    # PSF seria dominado por artefatos — descarta sem ajustar.
+    if mascara_invalida is not None:
+        cut_mask, _, _ = _recorte_float(
+            mascara_invalida.astype(np.float64), y0, x0, T.PSF_FIT_RAIO_PX
+        )
+        if cut_mask.mean() > 0.30:
+            return None
+
+    yy, xx = np.mgrid[0:cut.shape[0], 0:cut.shape[1]]
+    cx0 = np.float64(x0 - x_origin)
+    cy0 = np.float64(y0 - y_origin)
+    peak = np.float64(np.nanmax(cut))
+    if not np.isfinite(peak) or peak <= 0:
+        return None
+
+    fitter = fitting.LevMarLSQFitter()
+    fitted = None
+    modelo_nome = T.PSF_MODELO.lower()
+
+    try:
+        if modelo_nome == "moffat":
+            gamma0 = max(float(fwhm_px) / 2.0, 0.8)
+            model = Moffat2D(amplitude=peak, x_0=cx0, y_0=cy0,
+                             gamma=gamma0, alpha=2.5)
+            model.amplitude.bounds = (0.0, None)
+            model.x_0.bounds = (cx0 - 3.0, cx0 + 3.0)
+            model.y_0.bounds = (cy0 - 3.0, cy0 + 3.0)
+            model.gamma.bounds = (0.4, 8.0)
+            model.alpha.bounds = (1.1, 8.0)
+            fitted = fitter(model, xx, yy, cut, maxiter=T.PSF_MAX_ITER)
+            fwhm_fit = _fwhm_moffat(float(fitted.gamma.value),
+                                    float(fitted.alpha.value))
+        else:
+            raise ValueError("usar fallback gaussiano")
+    except Exception:
+        try:
+            sigma0 = max(float(fwhm_px) / 2.355, 0.5)
+            model = Gaussian2D(amplitude=peak, x_mean=cx0, y_mean=cy0,
+                               x_stddev=sigma0, y_stddev=sigma0)
+            model.amplitude.bounds = (0.0, None)
+            model.x_mean.bounds = (cx0 - 3.0, cx0 + 3.0)
+            model.y_mean.bounds = (cy0 - 3.0, cy0 + 3.0)
+            model.x_stddev.bounds = (0.4, 6.0)
+            model.y_stddev.bounds = (0.4, 6.0)
+            fitted = fitter(model, xx, yy, cut, maxiter=T.PSF_MAX_ITER)
+            fwhm_fit = 2.355 * float(np.sqrt(
+                fitted.x_stddev.value * fitted.y_stddev.value
+            ))
+            modelo_nome = "gaussian"
+        except Exception:
+            return None
+
+    if fitted is None:
+        return None
+
+    if isinstance(fitted, Moffat2D):
+        x_fit = float(fitted.x_0.value + x_origin)
+        y_fit = float(fitted.y_0.value + y_origin)
+        amplitude = float(fitted.amplitude.value)
+    else:
+        x_fit = float(fitted.x_mean.value + x_origin)
+        y_fit = float(fitted.y_mean.value + y_origin)
+        amplitude = float(fitted.amplitude.value)
+
+    if not (np.isfinite(x_fit) and np.isfinite(y_fit)
+            and np.isfinite(fwhm_fit) and np.isfinite(amplitude)):
+        return None
+
+    modelo_2d = fitted(xx, yy)
+    resid = cut - modelo_2d
+    resid_rms = float(np.sqrt(np.mean(resid ** 2)))
+    fluxo = float(np.sum(np.clip(modelo_2d, 0.0, None)))
+
+    return {
+        "x": np.float64(x_fit),
+        "y": np.float64(y_fit),
+        "flux": np.float64(fluxo),
+        "fwhm": np.float64(fwhm_fit),
+        "amplitude": np.float64(amplitude),
+        "resid_rms": np.float64(resid_rms),
+        "modelo": modelo_nome,
+    }
+
+
 def detectar_fontes(img: np.ndarray, sigma: float = 5.5,
                     fwhm_px: float = 3.0) -> list[tuple]:
     """
-    Detecta fontes pontuais usando photutils.DAOStarFinder.
-    Retorna lista de (y, x, flux, tamanho).
-    """
-    mean, median, std = sigma_clipped_stats(img, sigma=3.0, maxiters=5)
+    Detecta fontes pontuais com background local + refinamento PSF.
 
+    Retorna lista de (y, x, flux, tamanho), preservando o contrato público.
+    As coordenadas vêm do ajuste PSF em float64, sem arredondamento científico.
+    """
+    data = np.asarray(img, dtype=np.float64)
+    # Pan-STARRS marca saturação com 65535. Sem essa máscara, clusters saturados
+    # aparecem como picos acima do threshold e entram no casamento entre frames
+    # gerando trilhas com cinemática absurda que elimina também trilhas reais.
+    mascara = _mascara_pixels_invalidos(data)
+    background, rms = _estimar_background_local(data)
+    img_sub = (data - background).astype(np.float64)
+    detection_img = (img_sub / rms).astype(np.float64)
+    # Zerar pixels mascarados evita que (65535 - bg) / rms produza picos
+    # artificiais nos buracos antes de o DAOStarFinder receber a imagem.
+    detection_img[mascara] = 0.0
+
+    # DAOStarFinder fica como gerador de sementes em uma imagem já corrigida
+    # por background local. A medição final não é o centroide do DAO, e sim o
+    # centro do modelo PSF ajustado no recorte da fonte.
     finder = DAOStarFinder(
         fwhm=fwhm_px,
-        threshold=sigma * std,
+        threshold=float(sigma),
         sharpness_range=(T.SHARPNESS_MIN, T.SHARPNESS_MAX),
         roundness_range=(-T.ROUNDNESS_MAX, T.ROUNDNESS_MAX),
         exclude_border=True,
     )
-    tabela = finder(img - median)
+    tabela = finder(detection_img, mask=mascara)
     if tabela is None or len(tabela) == 0:
         return []
 
@@ -321,12 +1238,60 @@ def detectar_fontes(img: np.ndarray, sigma: float = 5.5,
 
     fontes = []
     for linha in tabela:
-        y    = float(linha[y_col])
-        x    = float(linha[x_col])
-        flux = float(linha["flux"])
-        tam  = float(np.pi * (fwhm_px / 2.0) ** 2)
+        y0 = np.float64(linha[y_col])
+        x0 = np.float64(linha[x_col])
+        psf = _ajustar_psf_subpixel(img_sub, x0=x0, y0=y0, fwhm_px=fwhm_px,
+                                    mascara_invalida=mascara)
+        if psf is None:
+            continue
+
+        # FWHM físico: raios cósmicos/hot pixels tendem a FWHM sub-pixel,
+        # enquanto blends, galáxias e trilhas têm FWHM grande demais para a PSF
+        # estelar do conjunto. Esse filtro protege a astrometria antes do WCS.
+        fwhm_fit = float(psf["fwhm"])
+        if not (T.FWHM_MIN_PX <= fwhm_fit <= T.FWHM_MAX_PX):
+            continue
+
+        y = float(np.float64(psf["y"]))
+        x = float(np.float64(psf["x"]))
+        flux = float(np.float64(psf["flux"]))
+        tam = float(np.pi * (fwhm_fit / 2.0) ** 2)
         fontes.append((y, x, flux, tam))
     return fontes
+
+
+def _detectar_fontes_worker(args: tuple[int, np.ndarray, float, float]) -> tuple[int, list[tuple]]:
+    """Worker top-level para multiprocessing com `spawn` no macOS/Apple Silicon."""
+    idx, data, sigma, fwhm_px = args
+    return idx, detectar_fontes(data, sigma=sigma, fwhm_px=fwhm_px)
+
+
+def _detectar_fontes_frames_paralelo(frames: list[dict], sigma: float) -> list[list[tuple]]:
+    """
+    Processa os 4 frames em paralelo.
+
+    Em Apple Silicon M2, quatro imagens FITS independentes são uma carga
+    naturalmente paralelizável: background local e PSF fitting não compartilham
+    estado entre frames. Limitamos a 4 processos para casar com a cadência do
+    IASC e evitar overhead de cópia maior que o ganho computacional.
+    """
+    tarefas = [
+        (i, np.asarray(f["data"], dtype=np.float64), float(sigma), float(T.FWHM_PX))
+        for i, f in enumerate(frames)
+    ]
+    n_proc = min(4, len(tarefas), os.cpu_count() or 1)
+    if n_proc <= 1:
+        return [detectar_fontes(f["data"], sigma=sigma) for f in frames]
+
+    try:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=n_proc) as pool:
+            resultados = pool.map(_detectar_fontes_worker, tarefas)
+        resultados.sort(key=lambda item: item[0])
+        return [fontes for _, fontes in resultados]
+    except Exception as e:
+        log(f"Multiprocessing indisponível; usando processamento serial: {e}", "WARN")
+        return [detectar_fontes(f["data"], sigma=sigma) for f in frames]
 
 
 # ─────────────────────────────────────────────
@@ -358,88 +1323,124 @@ def _casar_mutuo(fontes_a: list[tuple], fontes_b: list[tuple],
     return pares
 
 
-def _validar_coerencia_trilha(trilha: list[tuple]) -> tuple[bool, list[str]]:
+def _escala_pixel_arcsec(wcs: WCS | None) -> float:
+    """Escala média do pixel em arcsec/pixel a partir do WCS."""
+    if wcs is None:
+        return 0.26
+    try:
+        escalas = proj_plane_pixel_scales(wcs) * 3600.0
+        escalas = np.asarray(escalas, dtype=np.float64)
+        escalas = escalas[np.isfinite(escalas) & (escalas > 0)]
+        if escalas.size:
+            return float(np.median(escalas))
+    except Exception:
+        pass
+    return 0.26
+
+
+def _fontes_para_plano_celeste(fontes: list[tuple], frame: dict,
+                               ra_ref: float, dec_ref: float) -> np.ndarray:
     """
-    Verifica se uma trilha de 4 posições é cinematicamente coerente.
-
-    Retorna (valida, razoes_rejeicao).
-    Heurísticas físicas aplicadas:
-    - Passos individuais não devem mudar de direção abruptamente (> MAX_ANGULO_DEG)
-    - Razão entre o passo maior e o menor não deve exceder MAX_STEP_RATIO
-    - Aceleração entre passos consecutivos não deve exceder STEP_ACCEL_MAX px/frame²
+    Projeta fontes detectadas para um plano tangente local em arcsec.
+    Usa o WCS refinado do frame; se o WCS falhar, retorna coordenadas em pixel.
     """
-    pos = np.array([(t[1], t[0]) for t in trilha])   # (x, y)
-    passos = np.diff(pos, axis=0)                      # 3 vetores de passo
-    normas = np.linalg.norm(passos, axis=1)            # magnitude de cada passo
+    if not fontes:
+        return np.empty((0, 2), dtype=np.float64)
 
-    razoes = []
+    pix = np.array([(f[1], f[0]) for f in fontes], dtype=np.float64)
+    if not frame.get("wcs_ok") or frame.get("wcs") is None:
+        return np.array([(f[0], f[1]) for f in fontes], dtype=np.float64)
 
-    # Rejeita se algum passo for quase nulo enquanto outros são grandes
-    # (evita associação com fonte estática num frame)
-    if normas.max() > T.MIN_STEP_PX and normas.min() < T.MIN_STEP_PX:
-        razoes.append(
-            f"passo quase nulo em trilha com movimento real "
-            f"(min={normas.min():.2f} px, max={normas.max():.2f} px)"
-        )
+    try:
+        radec = frame["wcs"].all_pix2world(pix, 0).astype(np.float64)
+        cosdec = np.cos(np.radians(float(dec_ref)))
+        return np.column_stack([
+            _delta_ra_graus(radec[:, 0], ra_ref) * cosdec * 3600.0,
+            (radec[:, 1] - dec_ref) * 3600.0,
+        ])
+    except Exception:
+        return np.array([(f[0], f[1]) for f in fontes], dtype=np.float64)
 
-    # Consistência de direção: ângulo entre passos consecutivos
-    for i in range(len(passos) - 1):
-        n1, n2 = normas[i], normas[i + 1]
-        if n1 < 0.1 or n2 < 0.1:
-            continue
-        cos_ang = np.clip(
-            np.dot(passos[i], passos[i + 1]) / (n1 * n2), -1.0, 1.0
-        )
-        angulo = float(np.degrees(np.arccos(cos_ang)))
-        if angulo > T.MAX_ANGULO_DEG:
-            razoes.append(
-                f"mudança de direção excessiva entre passos {i+1}-{i+2}: "
-                f"{angulo:.1f}° (máx {T.MAX_ANGULO_DEG}°)"
-            )
 
-    # Consistência de distância: razão max/min de passos
-    if normas.min() > 0.1:
-        ratio = float(normas.max() / normas.min())
-        if ratio > T.MAX_STEP_RATIO:
-            razoes.append(
-                f"razão de passo inconsistente: {ratio:.2f}x "
-                f"(máx {T.MAX_STEP_RATIO}x)"
-            )
+def _media_ra_circular_graus(ras: list[float]) -> float:
+    """Média circular de RA em graus, correta em campos cruzando 0/360."""
+    ang = np.radians(np.asarray(ras, dtype=np.float64))
+    ra = np.degrees(np.arctan2(np.mean(np.sin(ang)), np.mean(np.cos(ang))))
+    return float(ra % 360.0)
 
-    # Aceleração: variação de passo entre frames consecutivos
-    for i in range(len(normas) - 1):
-        accel = abs(normas[i + 1] - normas[i])
-        if accel > T.STEP_ACCEL_MAX:
-            razoes.append(
-                f"aceleração excessiva entre passos {i+1}-{i+2}: "
-                f"{accel:.2f} px/frame (máx {T.STEP_ACCEL_MAX})"
-            )
 
-    return (len(razoes) == 0), razoes
+def _casar_mutuo_celeste(fontes_a: list[tuple], fontes_b: list[tuple],
+                         frame_a: dict, frame_b: dict,
+                         raio_px: float = None) -> dict[int, int]:
+    """
+    Casamento mútuo em coordenadas celestes projetadas pelo WCS refinado.
+    O raio operacional continua definido em pixels, convertido para arcsec.
+    """
+    if raio_px is None:
+        raio_px = T.RAIO_MATCH_PX
+    if not fontes_a or not fontes_b:
+        return {}
+
+    try:
+        ra_ref = _media_ra_circular_graus([
+            float(frame_a["wcs"].wcs.crval[0]),
+            float(frame_b["wcs"].wcs.crval[0]),
+        ])
+        dec_ref = float(np.mean([
+            float(frame_a["wcs"].wcs.crval[1]),
+            float(frame_b["wcs"].wcs.crval[1]),
+        ]))
+        escala = float(np.mean([
+            _escala_pixel_arcsec(frame_a.get("wcs")),
+            _escala_pixel_arcsec(frame_b.get("wcs")),
+        ]))
+        pa = _fontes_para_plano_celeste(fontes_a, frame_a, ra_ref, dec_ref)
+        pb = _fontes_para_plano_celeste(fontes_b, frame_b, ra_ref, dec_ref)
+        raio = float(raio_px) * escala
+    except Exception:
+        return _casar_mutuo(fontes_a, fontes_b, raio_px=raio_px)
+
+    if len(pa) == 0 or len(pb) == 0:
+        return {}
+
+    d2 = ((pa[:, None, :] - pb[None, :, :]) ** 2).sum(axis=2)
+    melhor_a_para_b = np.argmin(d2, axis=1)
+    melhor_b_para_a = np.argmin(d2, axis=0)
+
+    pares = {}
+    for i, j in enumerate(melhor_a_para_b):
+        if melhor_b_para_a[j] == i and d2[i, j] < raio ** 2:
+            pares[i] = int(j)
+    return pares
+
 
 
 def encontrar_movedores(frames: list[dict], sigma: float = 5.5) -> tuple[list[dict], dict]:
     """
     Compara fontes entre os 4 frames e identifica objetos com movimento
-    residual (após remover a deriva do campo).
+    residual após remover a deriva do campo.
 
-    Inclui validação cinemática de coerência de trilha.
+    Com WCS refinado por Gaia, o casamento mútuo opera sobre coordenadas
+    celestes projetadas em plano tangente local, não apenas em pixels brutos.
+
     Retorna (movedores, metricas_globais).
     """
-    todas_fontes = []
+    todas_fontes = _detectar_fontes_frames_paralelo(frames, sigma=sigma)
     n_fontes_por_frame = []
     for i, f in enumerate(frames):
-        fontes = detectar_fontes(f["data"], sigma=sigma)
-        todas_fontes.append(fontes)
+        fontes = todas_fontes[i]
         n_fontes_por_frame.append(len(fontes))
         log(f"  Frame {i+1} ({f['date_obs'][:19]}): {len(fontes)} fontes")
 
-    pares_12 = _casar_mutuo(todas_fontes[0], todas_fontes[1])
-    pares_23 = _casar_mutuo(todas_fontes[1], todas_fontes[2])
-    pares_34 = _casar_mutuo(todas_fontes[2], todas_fontes[3])
+    pares_12 = _casar_mutuo_celeste(todas_fontes[0], todas_fontes[1],
+                                    frames[0], frames[1])
+    pares_23 = _casar_mutuo_celeste(todas_fontes[1], todas_fontes[2],
+                                    frames[1], frames[2])
+    pares_34 = _casar_mutuo_celeste(todas_fontes[2], todas_fontes[3],
+                                    frames[2], frames[3])
 
     candidatos_brutos = []
-    n_rejeitados_coerencia = 0
+    n_trilhas_tentadas = 0
 
     for i0, i1 in pares_12.items():
         if i1 not in pares_23:
@@ -448,6 +1449,7 @@ def encontrar_movedores(frames: list[dict], sigma: float = 5.5) -> tuple[list[di
         if i2 not in pares_34:
             continue
         i3 = pares_34[i2]
+        n_trilhas_tentadas += 1
 
         f0 = todas_fontes[0][i0]
         f1 = todas_fontes[1][i1]
@@ -458,22 +1460,13 @@ def encontrar_movedores(frames: list[dict], sigma: float = 5.5) -> tuple[list[di
                   (f2[0], f2[1], f2[2]),
                   (f3[0], f3[1], f3[2])]
 
-        # Validação cinemática antes de aceitar a trilha
-        valida, razoes_cinem = _validar_coerencia_trilha(trilha)
-        if not valida:
-            n_rejeitados_coerencia += 1
-            log(f"  Trilha rejeitada por incoerência: {'; '.join(razoes_cinem)}", "WARN")
-            continue
-
-        pos  = np.array([(t[0], t[1]) for t in trilha])
+        pos  = np.array([(t[0], t[1]) for t in trilha], dtype=np.float64)
         move = float(np.hypot(pos[-1, 0] - pos[0, 0], pos[-1, 1] - pos[0, 1]))
         candidatos_brutos.append({
             "trilha"    : trilha,
             "move_total": move,
             "brilhos"   : [t[2] for t in trilha],
         })
-
-    n_trilhas_tentadas = len(candidatos_brutos) + n_rejeitados_coerencia
 
     deriva_dx, deriva_dy = 0.0, 0.0
     n_estaveis = 0
@@ -505,17 +1498,36 @@ def encontrar_movedores(frames: list[dict], sigma: float = 5.5) -> tuple[list[di
     else:
         movedores = []
 
-    if n_rejeitados_coerencia:
-        log(f"Trilhas rejeitadas por incoerência cinemática: {n_rejeitados_coerencia}", "WARN")
-
     metricas = {
-        "n_fontes_por_frame"          : n_fontes_por_frame,
-        "n_trilhas_tentadas"          : n_trilhas_tentadas,
-        "n_rejeitados_coerencia"      : n_rejeitados_coerencia,
-        "deriva_dx_px"                : round(deriva_dx, 3),
-        "deriva_dy_px"                : round(deriva_dy, 3),
-        "n_estaveis_deriva"           : n_estaveis,
-        "sigma_deteccao"              : sigma,
+        "n_fontes_por_frame"        : n_fontes_por_frame,
+        "n_trilhas_tentadas"        : n_trilhas_tentadas,
+        "deriva_dx_px"              : round(deriva_dx, 3),
+        "deriva_dy_px"              : round(deriva_dy, 3),
+        "n_estaveis_deriva"         : n_estaveis,
+        "sigma_deteccao"            : sigma,
+        "background_model"          : "photutils.Background2D",
+        "background_box_size"       : list(T.BACKGROUND_BOX),
+        "background_filter_size"    : list(T.BACKGROUND_FILTER),
+        "psf_model"                 : T.PSF_MODELO,
+        "psf_fwhm_range_px"         : [T.FWHM_MIN_PX, T.FWHM_MAX_PX],
+        "multiprocessing_processes" : min(4, len(frames), os.cpu_count() or 1),
+        "saturacao_pct_por_frame"   : [round(f.get("sat_pct", 0.0), 2) for f in frames],
+        "gaia_refinamento"          : [
+            {
+                "frame"               : f["arquivo"],
+                "status"              : f.get("wcs_status", "wcs_invalido"),
+                "rms_pre_arcsec"      : f.get("wcs_rms_pre_arcsec"),
+                "rms_pos_arcsec"      : f.get("wcs_rms_pos_arcsec"),
+                "n_matches"           : f.get("gaia_n_matches", 0),
+                "n_matches_bruto"     : f.get("gaia_n_matches_bruto", 0),
+                "offset_bruto_arcsec" : f.get("gaia_offset_bruto_arcsec", [0.0, 0.0]),
+                "n_matches_fino"      : f.get("gaia_n_matches_fino", 0),
+                "n_matches_ajuste"    : f.get("gaia_n_matches_ajuste", 0),
+                "n_matches_usados"    : f.get("gaia_n_matches_usados", 0),
+                "match_origem"        : f.get("gaia_match_origem"),
+            }
+            for f in frames
+        ],
     }
 
     return movedores, metricas
@@ -547,8 +1559,12 @@ def _morfologia_por_frame(img: np.ndarray, ty: float, tx: float,
         valido      : False se recorte degenerado (borda, fluxo nulo)
     """
     ny, nx = img.shape
-    y0 = max(0, int(ty) - r); y1 = min(ny, int(ty) + r)
-    x0 = max(0, int(tx) - r); x1 = min(nx, int(tx) + r)
+    # Inteiros são usados somente para delimitar o recorte em memória. O centro
+    # astrométrico `tx,ty` continua float64 em todos os cálculos de distância.
+    yc = int(np.rint(float(ty)))
+    xc = int(np.rint(float(tx)))
+    y0 = max(0, yc - r); y1 = min(ny, yc + r + 1)
+    x0 = max(0, xc - r); x1 = min(nx, xc + r + 1)
     cut = img[y0:y1, x0:x1].astype(np.float64)
 
     if cut.size < 4:
@@ -596,10 +1612,16 @@ def _morfologia_por_frame(img: np.ndarray, ty: float, tx: float,
         raios_acima = dist_map[mask_acima]
         fwhm_est = float(2.0 * raios_acima.max())
 
+    psf_fit = _ajustar_psf_subpixel(cut_sub, x0=cx_cut, y0=cy_cut,
+                                    fwhm_px=T.FWHM_PX)
+    fwhm_psf = float(psf_fit["fwhm"]) if psf_fit is not None else None
+    modelo_psf = psf_fit["modelo"] if psf_fit is not None else None
+
     return {
         "pontual"    : pontual,
         "elongation" : elongation,
-        "fwhm_est_px": round(fwhm_est, 2) if fwhm_est is not None else None,
+        "fwhm_est_px": fwhm_psf if fwhm_psf is not None else fwhm_est,
+        "modelo_psf" : modelo_psf,
         "valido"     : True,
     }
 
@@ -677,22 +1699,38 @@ def _verificar_falso_positivo(c: dict, frames: list[dict],
                 "(possível artefato, trail CCD ou galáxia de fundo)"
             )
 
+    # FWHM incompatível com a PSF estelar: a posição MPC precisa vir do centro
+    # de uma fonte pontual. FWHM sub-pixel é assinatura clássica de raio cósmico
+    # ou hot pixel; FWHM muito largo desloca o centro por blend/galáxia/trail.
+    fwhms = [float(m["fwhm_est_px"]) for m in metricas_morfo
+             if m["valido"] and m.get("fwhm_est_px") is not None
+             and np.isfinite(m["fwhm_est_px"])]
+    if fwhms:
+        fwhm_med = float(np.median(fwhms))
+        if fwhm_med < T.FWHM_MIN_PX or fwhm_med > T.FWHM_MAX_PX:
+            razoes.append(
+                f"FWHM incompatível com PSF estelar: mediana={fwhm_med:.2f} px "
+                f"(faixa aceita {T.FWHM_MIN_PX:.1f}-{T.FWHM_MAX_PX:.1f} px)"
+            )
+
     return razoes
 
 
 def _calcular_snr_local(img: np.ndarray, ty: float, tx: float,
-                        raio_sinal: int = 8, raio_bg: int = 20) -> float:
+                        raio_sinal: int = 4, raio_bg: int = 12) -> float:
     """
     SNR local simples: sinal = soma de pixels no raio_sinal após subtrair
     background estimado em annulus entre raio_sinal e raio_bg.
     """
     ny, nx = img.shape
-    y0s = max(0, int(ty) - raio_sinal); y1s = min(ny, int(ty) + raio_sinal)
-    x0s = max(0, int(tx) - raio_sinal); x1s = min(nx, int(tx) + raio_sinal)
+    yc = int(np.rint(float(ty)))
+    xc = int(np.rint(float(tx)))
+    y0s = max(0, yc - raio_sinal); y1s = min(ny, yc + raio_sinal + 1)
+    x0s = max(0, xc - raio_sinal); x1s = min(nx, xc + raio_sinal + 1)
     corte_sinal = img[y0s:y1s, x0s:x1s]
 
-    y0b = max(0, int(ty) - raio_bg); y1b = min(ny, int(ty) + raio_bg)
-    x0b = max(0, int(tx) - raio_bg); x1b = min(nx, int(tx) + raio_bg)
+    y0b = max(0, yc - raio_bg); y1b = min(ny, yc + raio_bg + 1)
+    x0b = max(0, xc - raio_bg); x1b = min(nx, xc + raio_bg + 1)
     corte_bg = img[y0b:y1b, x0b:x1b]
 
     bg_med  = float(np.median(corte_bg))
@@ -720,8 +1758,8 @@ def analisar_candidato(c: dict, frames: list[dict]) -> dict:
     Candidatos com razões de rejeição recebem classe=DESCARTA independente do score.
     """
     trilha    = c["trilha"]
-    pos       = np.array([(t[1], t[0]) for t in trilha])   # (x, y)
-    t_idx     = np.arange(4)
+    pos       = np.array([(t[1], t[0]) for t in trilha], dtype=np.float64)  # (x, y)
+    t_idx     = np.arange(4, dtype=np.float64)
     forma_img = frames[0]["data"].shape
 
     razoes_penalizacao: list[str] = []   # penaliza score mas não rejeita
@@ -769,8 +1807,10 @@ def analisar_candidato(c: dict, frames: list[dict]) -> dict:
 
         # Brilho: soma do recorte subtraído de background
         r = 20
-        y0_ = max(0, int(ty) - r); y1_ = min(frame["data"].shape[0], int(ty) + r)
-        x0_ = max(0, int(tx) - r); x1_ = min(frame["data"].shape[1], int(tx) + r)
+        yc = int(np.rint(float(ty)))
+        xc = int(np.rint(float(tx)))
+        y0_ = max(0, yc - r); y1_ = min(frame["data"].shape[0], yc + r + 1)
+        x0_ = max(0, xc - r); x1_ = min(frame["data"].shape[1], xc + r + 1)
         cut = frame["data"][y0_:y1_, x0_:x1_].astype(np.float64)
         bg  = np.percentile(cut, 30)
         brilhos[-1] = float(np.sum(np.clip(cut - bg, 0, None)))
@@ -1226,7 +2266,8 @@ def gerar_visualizacao(candidatos: list[dict], frames: list[dict],
 
                 ylabel_lines = [
                     f"#{ri+1} {cand['classe']}",
-                    f"Score {cand['score']}/10  ({cand['probabilidade']}%)",
+                    f"Score {cand['score']}/{cand.get('score_max', 12)}  "
+                    f"({cand['probabilidade']}%)",
                     f"Lin={cand['linearidade']:.2f}px  Vel={cand['vel_consistencia']:.2f}",
                 ]
                 if ra_str:
@@ -1248,7 +2289,7 @@ def gerar_visualizacao(candidatos: list[dict], frames: list[dict],
             if fi == 0:
                 ax.text(
                     0.97, 0.97,
-                    f"#{ri+1}  {cand['score']}/10",
+                    f"#{ri+1}  {cand['score']}/{cand.get('score_max', 12)}",
                     transform=ax.transAxes,
                     color=cor, fontsize=8, fontweight="bold",
                     ha="right", va="top",
@@ -1442,7 +2483,7 @@ def gerar_relatorio_txt(candidatos: list[dict], frames: list[dict],
             flags_str  = "  ".join(c.get("flags", []))
             resumo     = _resumo_diagnostico(c)
             linhas += [
-                f"  │  {rank_label}  score {c['score']}/10  {c['classe']}",
+                f"  │  {rank_label}  score {c['score']}/{c.get('score_max', 12)}  {c['classe']}",
                 f"  │     Lin={c['score_linearidade']}/3  "
                 f"Vel={c['score_velocidade']}/2  "
                 f"Fot={c['score_fotometria']}/2  "
@@ -1592,25 +2633,27 @@ def gerar_relatorio_txt(candidatos: list[dict], frames: list[dict],
         sep,
         "  METODOLOGIA",
         sub,
-        "  1. Detecção via photutils.DAOStarFinder + sigma-clipping (3σ background)",
-        "  2. Rastreamento com casamento mútuo recíproco de vizinho mais próximo",
-        "     + validação cinemática: ângulo de direção, razão de passo, aceleração",
-        "  3. Deriva instrumental estimada na mediana de fontes estáveis",
-        "  4. Rejeição de falsos positivos: borda, SNR baixo, hot pixel heurístico,",
-        "     brilho caótico, elongação grave sistemática",
-        f"  5. Score 0-{3+2+2+2+1+1+1}: linearidade(3) + velocidade(2) + fotometria(2)",
+        "  1. Background local via photutils.Background2D (box 50x50, filtro 3x3)",
+        "  2. Sementes pontuais em imagem SNR local + ajuste PSF Moffat/Gauss",
+        "     para centro sub-pixel e FWHM compatível com PSF estelar",
+        "  3. Rastreamento com casamento mútuo recíproco de vizinho mais próximo",
+        "     entre frames consecutivos",
+        "  4. Refinamento WCS por Gaia DR3 com fallback para Pan-STARRS",
+        "  5. Rejeição de falsos positivos: borda, SNR baixo, hot pixel heurístico,",
+        "     brilho caótico, elongação/FWHM incompatível com fonte pontual",
+        f"  6. Score 0-{3+2+2+2+1+1+1}: linearidade(3) + velocidade(2) + fotometria(2)",
         "     + morfologia(2) + consist.morfo(1) + elongação(1) + faixa_vel(1)",
-        "  6. Morfologia: pontualidade, elongação via PCA, FWHM estimada, consist. frames",
-        "  7. Conversão pixel→RA/Dec via WCS primário Pan-STARRS",
-        "  8. Correspondência posicional: SkyBot/IMCCE, cone 2 arcmin",
-        "  9. MPC 80-colunas com magnitude omitida (requer calibração Astrometrica)",
+        "  7. Morfologia: pontualidade, elongação via PCA, FWHM PSF, consist. frames",
+        "  8. Conversão pixel→RA/Dec via WCS Pan-STARRS refinado por Gaia DR3",
+        "  9. Correspondência posicional: SkyBot/IMCCE, cone 2 arcmin",
+        " 10. MPC 80-colunas com magnitude omitida (requer calibração Astrometrica)",
         "  NOTA: o score é heurístico e ajustado para pré-triagem, não probabilidade",
         "        estatisticamente calibrada. Thresholds centralizados em T.* no código.",
         "",
         "  LIMITAÇÕES",
         sub,
         "  - Sem calibração fotométrica absoluta (magnitude = branco no MPC)",
-        "  - WCS do Pan-STARRS ignora correções polinomiais proprietárias",
+        "  - WCS usa Pan-STARRS como solução inicial e Gaia DR3 quando disponível",
         "  - Score heurístico refinado: não substitui digest2 nem CNN",
         "  - SkyBot indica vizinhança posicional — ausência de match ≠ novidade",
         "  - Validação humana no Astrometrica é obrigatória antes de enviar ao IASC",
@@ -1771,7 +2814,9 @@ def exportar_json(candidatos: list[dict], frames: list[dict],
                     {
                         "elongation" : round(m["elongation"], 4),
                         "pontual"    : round(m["pontual"], 5),
-                        "fwhm_est_px": m["fwhm_est_px"],
+                        "fwhm_est_px": round(float(m["fwhm_est_px"]), 4)
+                                       if m["fwhm_est_px"] is not None else None,
+                        "modelo_psf" : m.get("modelo_psf"),
                         "valido"     : m["valido"],
                     }
                     for m in c.get("metricas_morfo", [])
@@ -1833,6 +2878,9 @@ def main():
     pasta_img = Path(args.imagens)
     pasta_out = Path(args.output)
     pasta_out.mkdir(parents=True, exist_ok=True)
+    arquivos_ini = sorted(pasta_img.glob("*.fits")) + sorted(pasta_img.glob("*.fit"))
+    nome_conjunto = (arquivos_ini[0].name.split("_")[0].split(".")[0]
+                     if arquivos_ini else "pipeline")
 
     observador = _resolver_observador(args)
 
@@ -1841,12 +2889,11 @@ def main():
     print(f"  Observador: {observador['nome']}  <{observador['email']}>")
     print(f"{'='*60}{Cor.RESET}\n")
 
+    arq_log = configurar_log_arquivo(pasta_out, nome_conjunto)
+    log(f"Log do pipeline: {arq_log}")
     log("Carregando imagens FITS...")
     frames = carregar_fits(pasta_img)
     nome_conjunto = frames[0]["arquivo"].split("_")[0].split(".")[0]
-
-    arq_log = configurar_log_arquivo(pasta_out, nome_conjunto)
-    log(f"Log do pipeline: {arq_log}")
 
     log("\nDetectando objetos em movimento...")
     movedores, metricas_globais = encontrar_movedores(frames, sigma=args.sigma)
