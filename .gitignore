@@ -7,24 +7,24 @@ venv/
 env/
 .venv/
 
-# Dados astronômicos (não versionar imagens FITS brutas)
-imagens/*.fits
-imagens/*.fit
-imagens/*.fts
-imagens/**/*.fits
-imagens/**/*.fit
-imagens/**/*.fts
+# Raw astronomical data
+images/*.fits
+images/*.fit
+images/*.fts
+images/**/*.fits
+images/**/*.fit
+images/**/*.fts
 
-# Resultados gerados (opcional — comente se quiser versionar)
-resultados/*.png
-resultados/*.txt
-resultados/*.json
-resultados/*.log
-resultados/**/*.png
-resultados/**/*.txt
-resultados/**/*.json
-resultados/**/*.log
-resultados_debug/
+# Generated outputs
+results/*.png
+results/*.txt
+results/*.json
+results/*.log
+results/**/*.png
+results/**/*.txt
+results/**/*.json
+results/**/*.log
+results_debug/
 
 # macOS
 .DS_Store
@@ -37,7 +37,7 @@ resultados_debug/
 .ipynb_checkpoints/
 *.ipynb
 
-# Distribuição
+# Distribution
 dist/
 build/
 *.egg-info/
