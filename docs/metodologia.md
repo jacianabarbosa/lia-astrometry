@@ -1,4 +1,8 @@
-# Metodologia Técnica — asteroid-hunter
+# Metodologia Técnica — TRITON
+
+**Tracking and Robust Identification of Transient Objects in the Night**
+
+**Rastreamento e Identificação Robusta de Objetos Transientes na Noite**
 
 **Autora: Jaciana Barbosa**  
 **Versão: 1.4.2**
@@ -7,7 +11,7 @@
 
 ## 1. Visão Geral do Pipeline
 
-O asteroid-hunter implementa um pipeline de pré-triagem para objetos em movimento em sequências FITS do IASC/Pan-STARRS. O IASC (International Astronomical Search Collaboration) é um programa internacional de ciência cidadã, realizado em parceria com a NASA, em que estudantes, professores e astrônomos amadores analisam imagens reais de telescópios profissionais para identificar e medir asteroides. No fluxo tratado por este projeto, as imagens vêm do Pan-STARRS, conjunto de telescópios localizado no Observatório Haleakalā, na ilha de Maui, Havaí.
+O TRITON implementa um pipeline de pré-triagem para objetos em movimento em sequências FITS do IASC/Pan-STARRS. O IASC (International Astronomical Search Collaboration) é um programa internacional de ciência cidadã, realizado em parceria com a NASA, em que estudantes, professores e astrônomos amadores analisam imagens reais de telescópios profissionais para identificar e medir asteroides. No fluxo tratado por este projeto, as imagens vêm do Pan-STARRS, conjunto de telescópios localizado no Observatório Haleakalā, na ilha de Maui, Havaí.
 
 A entrada típica são quatro imagens do mesmo campo, feitas em horários diferentes. Estrelas e galáxias de fundo devem permanecer praticamente fixas; um objeto do Sistema Solar aparece como uma fonte pontual que se desloca entre os frames.
 
@@ -72,7 +76,7 @@ O background é estimado por `photutils.Background2D` com malha local e filtro m
 Background2D(data, box_size=(50, 50), filter_size=(3, 3), mask=mascara)
 ```
 
-Essa abordagem é mais robusta que um percentil global porque preserva variações suaves de fundo e evita que regiões saturadas inflem a estatística local.
+Essa abordagem é mais robusta que um percentil global porque preserva variações suaves de fundo e evita que regiões saturadas inflem a estatística local. Em imagens de varredura ampla, como as do Pan-STARRS, esse ponto é importante: o fundo pode mudar por halos de estrelas brilhantes, bordas de CCD, gradientes de céu e pixels mascarados.
 
 ### 4.2 DAOStarFinder e PSF
 
@@ -113,7 +117,7 @@ Estima o offset de translação pura por votação 2D dos pares detecção-Gaia 
 
 Com o WCS pré-corrigido, as detecções são reprojetadas e casadas com Gaia dentro do raio apertado. Com matches suficientes, o pipeline pode resolver uma transformação afim por mínimos quadrados com sigma-clipping e reconstruir a CD matrix.
 
-O refinamento afim é aceito apenas se o RMS pós-ajuste ficar abaixo de `0.5 arcsec`. Se a passada fina já deixa RMS abaixo de `1.0 arcsec`, o pipeline usa `gaia_skipped_pre_baixo` e mantém o WCS bruto corrigido. Se a passada fina falhar, o offset bruto é preservado com status `gaia_offset_bruto_apenas`.
+O refinamento é aceito quando o RMS pós-ajuste fica abaixo do limiar operacional definido em `T.GAIA_DIFF_MAX_ARCSEC` (`0.9 arcsec` na versão atual). Se a passada fina já deixa RMS abaixo desse limiar, o pipeline mantém o WCS bruto corrigido sem forçar ajuste afim adicional. Se a passada fina falhar, o offset bruto é preservado com status `gaia_offset_bruto_apenas`.
 
 ### 5.3 Status e fallback
 
@@ -121,7 +125,7 @@ O refinamento é sempre gracioso. O status por frame é registrado em `metricas_
 
 | Status                    | Significado                                              |
 |---------------------------|----------------------------------------------------------|
-| `gaia_refinado`           | Ajuste afim completo aceito (RMS < 0.5 arcsec)          |
+| `gaia_refinado`           | Refinamento aceito dentro do limiar de RMS              |
 | `gaia_offset_bruto_apenas`| Só translação aplicada; passada fina insuficiente        |
 | `gaia_skipped_pre_baixo`  | WCS Pan-STARRS já era bom (RMS < 1.0 arcsec)            |
 | `gaia_falhou_rede`        | Gaia não respondeu                                       |
@@ -176,7 +180,27 @@ Candidatos rejeitados recebem `classe=DESCARTA`, flag `REJEITADO_FP` e razão ex
 
 ## 8. Sistema de Score
 
-O score é heurístico e vai de 0 a 12 pontos.
+O score é uma heurística de coerência cinemática e morfológica. Ele não é uma probabilidade estatística calibrada; é uma forma reprodutível de priorizar candidatos que se comportam como fontes pontuais em movimento aproximadamente uniforme.
+
+Para uma trilha com quatro posições medidas,
+
+```text
+p_i = (x_i, y_i),  i = 0, 1, 2, 3
+```
+
+o pipeline ajusta uma reta em função do índice temporal dos frames e mede o resíduo médio:
+
+```text
+r_lin = média( || p_i - p̂_i || )
+```
+
+Também calcula os passos entre frames:
+
+```text
+v_i = p_{i+1} - p_i
+```
+
+e usa a dispersão desses passos como medida de regularidade do movimento. Um objeto real do Sistema Solar, em uma sequência curta, tende a ter deslocamento aproximadamente linear e velocidade angular quase constante. Artefatos, blends e associações erradas costumam produzir saltos irregulares.
 
 | Componente              | Máx | Critério                                               |
 |-------------------------|-----|--------------------------------------------------------|
@@ -199,7 +223,21 @@ Os thresholds ficam centralizados na classe `T` em `src/detector.py`.
 
 ---
 
-## 9. Conversão Astrométrica e SkyBot
+## 9. Paralelização e Desempenho
+
+A detecção de fontes é executada em paralelo por frame usando `multiprocessing` com contexto `spawn`, adequado ao macOS. Como os quatro frames são independentes durante a etapa de background local, DAOStarFinder e ajuste PSF, essa etapa se beneficia de processamento paralelo sem compartilhar estado científico entre imagens.
+
+O número de processos é limitado a quatro:
+
+```text
+n_proc = min(4, n_frames, os.cpu_count())
+```
+
+O tempo total ainda depende fortemente de rede, porque a consulta Gaia DR3 é feita por frame e a consulta SkyBot pode envolver latência externa. Por isso, tempos de execução devem ser reportados junto com o status das consultas externas. Em execuções recentes no conjunto `XY14_p10`, o pipeline processou 4 frames em cerca de 40 s com Gaia ativo.
+
+---
+
+## 10. Conversão Astrométrica e SkyBot
 
 As posições de pixel são convertidas para RA/Dec usando o WCS disponível no frame: refinado por Gaia DR3 quando o ajuste foi aceito, ou Pan-STARRS inicial quando o fallback foi acionado.
 
@@ -217,7 +255,7 @@ Interpretação:
 
 ---
 
-## 10. Outputs
+## 11. Outputs
 
 Para cada conjunto processado, o pipeline gera:
 
@@ -231,7 +269,7 @@ O relatório MPC deixa magnitude em branco porque o pipeline não faz calibraç�
 
 ---
 
-## 11. Validação
+## 12. Validação
 
 A suíte de testes da v1.4.2 cobre 72 casos, incluindo:
 
@@ -248,12 +286,12 @@ A suíte de testes da v1.4.2 cobre 72 casos, incluindo:
 Execução:
 
 ```bash
-python -m pytest testes/teste_basico.py -v
+venv/bin/python -m pytest testes/teste_basico.py -v
 ```
 
 ---
 
-## 12. Limitações
+## 13. Limitações
 
 - A conexão com Gaia DR3 e SkyBot depende de rede; ambos têm fallback, mas a precisão/identificação pode ficar limitada.
 - Não há calibração fotométrica absoluta; magnitude final deve ser medida no Astrometrica.
@@ -263,5 +301,6 @@ python -m pytest testes/teste_basico.py -v
 
 ---
 
-*Documento atualizado para: asteroid-hunter v1.4.2*  
+*Documento atualizado para: TRITON v1.4.2*
+
 *Autora: Jaciana Barbosa — 2026*

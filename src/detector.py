@@ -1,6 +1,6 @@
 """
 =============================================================================
-asteroid-hunter — detector.py
+TRITON — detector.py
 =============================================================================
 Pipeline de pré-triagem de asteroides em imagens FITS do IASC/Pan-STARRS.
 
@@ -236,7 +236,7 @@ class Cor:
     NEGRITO  = "\033[1m"
     RESET    = "\033[0m"
 
-_logger = logging.getLogger("asteroid-hunter")
+_logger = logging.getLogger("TRITON")
 
 def log(msg, nivel="INFO"):
     cores = {"INFO": Cor.AZUL, "OK": Cor.VERDE,
@@ -2155,7 +2155,7 @@ def gerar_relatorio_mpc(candidatos: list[dict], frames: list[dict],
         f.write("OBS IASC Citizen Scientist\n")
         f.write(f"MEA {nome_obs}\n")
         f.write("TEL 1.8-m f/4.4 Ritchey-Chretien + CCD\n")
-        f.write(f"ACK asteroid-hunter pipeline v{VERSAO}\n")
+        f.write(f"ACK TRITON pipeline v{VERSAO}\n")
         f.write(f"AC2 {email_obs}\n")
         f.write("----- ------------------- ------------------ "
                 "------------------ ----- ---\n")
@@ -2312,7 +2312,7 @@ def gerar_visualizacao(candidatos: list[dict], frames: list[dict],
                 )
 
     plt.suptitle(
-        f"asteroid-hunter v{VERSAO} | {nome_conjunto} | "
+        f"TRITON v{VERSAO} | {nome_conjunto} | "
         f"{frames[0]['date_obs'][:10]}\n"
         "● posição atual   + posição anterior   → vetor trajetória",
         color="white", fontsize=11, y=1.01,
@@ -2400,7 +2400,7 @@ def gerar_relatorio_txt(candidatos: list[dict], frames: list[dict],
     # ── Cabeçalho ──────────────────────────────────────────────────────────
     linhas += [
         sep,
-        "  ASTEROID-HUNTER — Relatório de Análise",
+        "  TRITON — Relatório de Análise",
         f"  Versão do pipeline   : {VERSAO}",
         f"  Data de processamento: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"  Conjunto de imagens  : {nome_conjunto}",
@@ -2430,7 +2430,7 @@ def gerar_relatorio_txt(candidatos: list[dict], frames: list[dict],
         f"  Tempo de execução    : {mg.get('tempo_execucao_s', '?')} s",
         "", sub,
         f"  Candidatos totais    : {len(candidatos)}",
-        f"  FORTE    (8-10) : {sum(1 for c in candidatos if c['classe']=='FORTE')}",
+        f"  FORTE    (8-12) : {sum(1 for c in candidatos if c['classe']=='FORTE')}",
         f"  MODERADO (6-7)  : {sum(1 for c in candidatos if c['classe']=='MODERADO')}",
         f"  FRACO    (4-5)  : {sum(1 for c in candidatos if c['classe']=='FRACO')}",
         f"  DESCARTA (0-3)  : {sum(1 for c in candidatos if c['classe']=='DESCARTA')}",
@@ -2636,8 +2636,8 @@ def gerar_relatorio_txt(candidatos: list[dict], frames: list[dict],
         "  1. Background local via photutils.Background2D (box 50x50, filtro 3x3)",
         "  2. Sementes pontuais em imagem SNR local + ajuste PSF Moffat/Gauss",
         "     para centro sub-pixel e FWHM compatível com PSF estelar",
-        "  3. Rastreamento com casamento mútuo recíproco de vizinho mais próximo",
-        "     entre frames consecutivos",
+        "  3. Rastreamento em plano celeste local via WCS por frame",
+        "     + casamento mútuo recíproco entre frames consecutivos",
         "  4. Refinamento WCS por Gaia DR3 com fallback para Pan-STARRS",
         "  5. Rejeição de falsos positivos: borda, SNR baixo, hot pixel heurístico,",
         "     brilho caótico, elongação/FWHM incompatível com fonte pontual",
@@ -2660,7 +2660,7 @@ def gerar_relatorio_txt(candidatos: list[dict], frames: list[dict],
         "  - Heurísticas de falso positivo podem rejeitar candidatos legítimos em",
         "    campos com PSF degradada — revisar DESCARTA com flag REJEITADO_FP",
         "",
-        f"  Pipeline : asteroid-hunter v{VERSAO}",
+        f"  Pipeline : TRITON v{VERSAO}",
         "  Autora   : Jaciana Barbosa",
         sep,
     ]
@@ -2722,7 +2722,7 @@ def exportar_json(candidatos: list[dict], frames: list[dict],
     """
     # Cabeçalho global
     saida = {
-        "pipeline"      : f"asteroid-hunter v{VERSAO}",
+        "pipeline"      : f"TRITON v{VERSAO}",
         "conjunto"      : nome_conjunto,
         "processado_em" : datetime.now().isoformat(timespec="seconds"),
         "observatorio"  : "Pan-STARRS / IASC (F51)",
@@ -2841,8 +2841,8 @@ def exportar_json(candidatos: list[dict], frames: list[dict],
 # 11. PIPELINE PRINCIPAL
 # ─────────────────────────────────────────────
 def _resolver_observador(args) -> dict:
-    nome  = args.observador or os.environ.get("ASTEROID_HUNTER_OBS",  "Observador IASC")
-    email = args.email      or os.environ.get("ASTEROID_HUNTER_EMAIL", "observer@example.com")
+    nome = args.observador or os.environ.get("TRITON_OBS") or "Observador IASC"
+    email = args.email or os.environ.get("TRITON_EMAIL") or "observer@example.com"
     return {"nome": nome, "email": email}
 
 
@@ -2863,7 +2863,7 @@ def _deduplicar(candidatos: list[dict], raio_px: float = None) -> list[dict]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="asteroid-hunter — Pré-triagem de asteroides em FITS do IASC"
+        description="TRITON — Pré-triagem de asteroides em FITS do IASC"
     )
     parser.add_argument("--imagens",    type=str, default="imagens")
     parser.add_argument("--output",     type=str, default="resultados")
@@ -2885,7 +2885,7 @@ def main():
     observador = _resolver_observador(args)
 
     print(f"\n{Cor.NEGRITO}{'='*60}")
-    print(f"  ASTEROID-HUNTER v{VERSAO}")
+    print(f"  TRITON v{VERSAO}")
     print(f"  Observador: {observador['nome']}  <{observador['email']}>")
     print(f"{'='*60}{Cor.RESET}\n")
 

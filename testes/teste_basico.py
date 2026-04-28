@@ -1,7 +1,7 @@
 """
 testes/teste_basico.py
 ======================
-Testes unitários e de integração do pipeline asteroid-hunter v1.4.
+Testes unitários e de integração do pipeline TRITON v1.4.
 
 Cobertura:
     - detectar_fontes: fonte simples, múltiplas, imagem vazia
@@ -19,8 +19,8 @@ Cobertura:
     - Integração: pipeline end-to-end com FITS sintético (JSON v1.4)
 
 Uso:
-    cd asteroid-hunter
-    python -m pytest testes/teste_basico.py -v
+    cd triton
+    venv/bin/python -m pytest testes/teste_basico.py -v
 """
 
 import sys
