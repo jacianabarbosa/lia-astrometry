@@ -89,6 +89,33 @@ Lia converts FITS image arrays to `float64` at load time and keeps sub-pixel sou
 
 Invalid pixels are masked before background estimation and source detection. The mask covers saturated pixels, near-zero invalid pixels, and non-finite values. This prevents saturated regions from inflating local background RMS and prevents invalid pixels from becoming artificial detections.
 
+Pan-STARRS campaign frames can mark saturated, defective, or off-CCD pixels with values near `65535`. Lia masks values from `65500` upward, pixels below the minimum valid signal threshold, and non-finite values. A frame with more than 5% invalid pixels is reported as reduced quality; above 25%, processing stops so the observer can obtain a replacement frame.
+
+## WCS Construction And Gaia Refinement
+
+Pan-STARRS FITS headers may contain proprietary polynomial distortion keywords such as `PCA1X0Y2` and `PCA2X0Y2`. Lia avoids direct use of `astropy.wcs.WCS(header)` for these frames because those keywords can be interpreted as PC matrix elements and produce singular WCS solutions. Instead, it reconstructs a two-axis WCS from `CTYPE`, `CRVAL`, `CRPIX`, `CD` or `CDELT`, and optional `CROTA`. Gaia and header modes both start from this reconstructed WCS.
+
+The Gaia refinement uses a broad translation stage followed by a narrower match stage. The broad stage builds all detection-Gaia pairs within the coarse radius, votes in a two-dimensional offset histogram, keeps the dominant translation cluster, enforces one-to-one pairs, and estimates the offset with the median of the selected residuals. A second translation pass can remove small residual bias after the first CRVAL update.
+
+The optional affine update is solved by least squares on normalized matched pixel coordinates. Before accepting it, Lia checks matrix conditioning and performs up to four residual-rejection iterations using a median absolute deviation threshold. If the affine solution is ill-conditioned, has too few matches after clipping, or leaves post-fit RMS above the acceptance threshold, Lia keeps the coarse translation WCS and records that status instead of forcing a worse solution.
+
+## Kinematic Metric Definition
+
+For each candidate track with positions `(x_i, y_i)` in the four chronological frames, Lia fits independent least-squares linear models `x(i) = a_x i + b_x` and `y(i) = a_y i + b_y`, where `i = 0, 1, 2, 3`. The reported linear residual is the mean Euclidean residual:
+
+```text
+mean_i sqrt((x_i - xhat_i)^2 + (y_i - yhat_i)^2)
+```
+
+The reported `linear_r2` is a combined two-dimensional coefficient:
+
+```text
+R^2 = 1 - sum_i[(x_i - xhat_i)^2 + (y_i - yhat_i)^2]
+          / sum_i[(x_i - mean(x))^2 + (y_i - mean(y))^2]
+```
+
+This definition measures how well a single straight-line motion model explains the two-dimensional track. The score uses the residual thresholds for triage; `linear_r2` is exported for audit and validation.
+
 ## Gaia Vs Header-Only Evaluation
 
 The main operational mode is:
@@ -106,6 +133,10 @@ python src/detector.py --wcs-mode header
 The header mode disables only Gaia DR3 refinement. Background estimation, PSF fitting, detection threshold, tracking, scoring, filters, and outputs remain identical. This supports a controlled comparison of candidate recovery, ranking changes, RA/Dec differences, angular separation from Astrometrica measurements, Gaia RMS, and match counts.
 
 Only the final Astrometrica-generated report should be submitted to IASC. The Gaia/header comparison is an internal validation study.
+
+## SkyBot Reproducibility
+
+Known-object checks use the IMCCE SkyBot cone-search service through `astroquery.imcce.Skybot`. Lia records whether the query succeeded, failed, returned no positional match, or returned likely or ambiguous nearby known Solar System objects. Because external services can change behavior or availability, campaign validation should record the Lia version, dependency versions, execution timestamp, and SkyBot status stored in the JSON output.
 
 ## Validation Plan
 
@@ -133,6 +164,20 @@ Metrics to collect:
 ### Internal Gaia Comparison
 
 Run each set with `--wcs-mode gaia` and `--wcs-mode header`, then export both JSON outputs through `tools/export_metrics.py`. Compare ranking changes, Gaia RMS, match counts, coordinate differences, and angular separation from Astrometrica measurements.
+
+### Future Statistical Calibration
+
+The current score is a transparent ranking heuristic. With enough validated campaign outcomes, the score and its components can be calibrated with logistic regression, ROC analysis, or beta calibration to estimate calibrated real-candidate confidence. Lia intentionally does not expose such a calibrated confidence value until a sufficient positive and negative validation set exists.
+
+## Related Work And References
+
+- Gaia Collaboration et al. (2023), *Gaia Data Release 3*, Astronomy & Astrophysics, 674, A1.
+- Stetson, P. B. (1987), *DAOPHOT: A Computer Program for Crowded-Field Stellar Photometry*, Publications of the Astronomical Society of the Pacific, 99, 191.
+- Bradley et al. (2024), *astropy/photutils: source detection and photometry tools*.
+- Astropy Collaboration et al. (2022), *The Astropy Project: sustaining and growing a community-oriented open-source project*.
+- IMCCE SkyBot cone-search documentation, used through `astroquery.imcce.Skybot`.
+- Smullen et al. (2025), *TRIPP: TRansient Image Processing Pipeline*, arXiv:2501.18142.
+- International Astronomical Search Collaboration (IASC), Astrometrica workflow guidance, and AIsteroid legacy detection workflow materials.
 
 ## Limitations
 
