@@ -19,6 +19,12 @@ IASC/Pan-STARRS practice and campaign sets usually contain four FITS frames of t
 
 The output is intentionally conservative. A high-ranked candidate is not a confirmed asteroid discovery. It is a candidate worth measuring or rejecting in the normal Astrometrica workflow.
 
+## Example Output
+
+![Example candidates](images/example_candidates.png)
+
+Visualization produced by Lia for an IASC sequence. Each row is one candidate; columns are the four frames in chronological order. Colored circles mark the measured centroid and arrows show the motion direction.
+
 ## Positioning
 
 Lia is a pre-screening pipeline. It prioritizes candidates; it does not confirm discoveries, submit observations, or replace the final measurement process.
@@ -32,6 +38,7 @@ The triage score is heuristic. It is useful for ranking and auditing, but it is 
 - FITS loading with `float64` image handling for numerical stability.
 - Mid-exposure JD/MJD extraction from `DATE-OBS` or `MJD-OBS` plus exposure time.
 - Local sky estimation with `photutils.Background2D`.
+- Saturation masking for Pan-STARRS pixels flagged near `65535`, typical of saturated, defective, or off-CCD regions, preventing spurious detections and inflated local background RMS estimates.
 - Source detection with `DAOStarFinder`.
 - Sub-pixel centroid refinement using a Moffat PSF model with Gaussian fallback.
 - FWHM and morphology checks to reject hot pixels, cosmic-ray-like detections, blends, and extended sources.
@@ -68,6 +75,8 @@ venv/bin/python -m pip install -r requirements.txt
 venv/bin/python -m pytest tests/test_basic.py -v
 ```
 
+The current test suite has 92 tests covering public identity, source detection, WCS handling, Gaia refinement, kinematic scoring, saturation masking, header-mode behavior, JSON traceability, and CSV metric export.
+
 ## Usage
 
 Basic run:
@@ -97,6 +106,27 @@ export LIA_OBS="Jaciana Barbosa"
 export LIA_EMAIL="name@example.com"
 ```
 
+## Command-Line Options
+
+```text
+usage: detector.py [-h] [--images IMAGES] [--output OUTPUT] [--sigma SIGMA]
+                   [--no-mpc] [--observer OBSERVER] [--email EMAIL]
+                   [--wcs-mode {gaia,header}]
+
+Lia - pre-screen moving-object candidates in IASC FITS sequences
+
+options:
+  -h, --help            show this help message and exit
+  --images IMAGES       input folder containing exactly four FITS frames
+  --output OUTPUT       output folder for reports, JSON, logs, and plots
+  --sigma SIGMA         local-SNR detection threshold, default 5.5
+  --no-mpc              skip SkyBot/IMCCE neighborhood checks
+  --observer OBSERVER   observer name for draft auxiliary reports
+  --email EMAIL         observer email for draft auxiliary reports
+  --wcs-mode {gaia,header}
+                        WCS mode: Gaia DR3 refinement or reconstructed header WCS
+```
+
 ## Running With Gaia And Header-Only WCS Modes
 
 Gaia DR3 refinement is the default mode:
@@ -110,6 +140,8 @@ Header-only mode disables only Gaia refinement. Background estimation, PSF fitti
 ```bash
 venv/bin/python src/detector.py --images fits/set01 --output results/set01_header --wcs-mode header
 ```
+
+Technical note: Lia does not call `astropy.wcs.WCS(header)` directly for Pan-STARRS frames. These FITS headers can include proprietary distortion keywords such as `PCA1X0Y2` and `PCA2X0Y2`, which the standard parser may interpret as PC matrix entries and fail with singular matrices. Lia reconstructs the header WCS from the primary astrometric keywords (`CTYPE`, `CRVAL`, `CRPIX`, `CD`/`CDELT`, and `CROTA`). Both modes start from this reconstruction; only the Gaia DR3 refinement step differs.
 
 This allows an internal comparison using the same code path:
 
@@ -157,13 +189,17 @@ The CSV files include empty columns such as `measured_in_astrometrica`, `include
 
 The triage score ranges from 0 to 12 and combines:
 
-- linearity of the four-frame track;
-- consistency of frame-to-frame motion;
-- relative photometric stability;
-- point-source morphology;
-- morphology consistency across frames;
-- elongation;
-- motion range typical of main-belt asteroid candidates in short IASC sequences.
+| Component | Max | Rationale |
+|---|---:|---|
+| Linearity | 3 | four-frame track residual around a linear trajectory |
+| Velocity consistency | 2 | uniformity of frame-to-frame steps |
+| Photometric stability | 2 | relative flux stability across frames |
+| Point-source morphology | 2 | rejection of diffuse, blended, or artifact-like sources |
+| Morphology consistency | 1 | stability of source shape across frames |
+| Elongation | 1 | penalty for trailed or extended detections |
+| Typical motion range | 1 | total displacement consistent with short IASC main-belt candidate sequences |
+
+Total: 12. The score is a heuristic for ranking, not a calibrated likelihood.
 
 Classes:
 
@@ -212,6 +248,10 @@ venv/bin/python src/detector.py --wcs-mode header
 
 Compare recovery, ranking, Gaia RMS, match counts, and angular differences relative to Astrometrica measurements. This comparison is internal; only the final Astrometrica-generated report should enter the official IASC workflow.
 
+### Future Statistical Calibration
+
+The heuristic score is a ranking tool. Future work can calibrate it against validated IASC outcomes using logistic regression, ROC analysis, or beta calibration to estimate calibrated real-candidate confidence. This requires a sufficient number of positive and negative outcomes from the Astrometrica/IASC workflow.
+
 ## Limitations
 
 - Lia does not replace Astrometrica.
@@ -248,9 +288,12 @@ The full technical methodology is maintained in [docs/methodology.md](docs/metho
 ## References
 
 - Gaia Collaboration et al. (2023), *Gaia Data Release 3*, Astronomy & Astrophysics, 674, A1.
+- Stetson, P. B. (1987), *DAOPHOT: A Computer Program for Crowded-Field Stellar Photometry*, Publications of the Astronomical Society of the Pacific, 99, 191.
 - Bradley et al. (2024), *astropy/photutils: source detection and photometry tools*.
 - Astropy Collaboration et al. (2022), *The Astropy Project: sustaining and growing a community-oriented open-source project*.
-- IMCCE SkyBot documentation.
+- IMCCE SkyBot cone-search documentation, used through `astroquery.imcce.Skybot`.
+- Smullen et al. (2025), *TRIPP: TRansient Image Processing Pipeline*, arXiv:2501.18142.
+- International Astronomical Search Collaboration (IASC) and AIsteroid legacy detection workflow materials.
 - Minor Planet Center astrometry and observation-format documentation.
 - IASC public campaign materials and Astrometrica workflow guidance.
 
