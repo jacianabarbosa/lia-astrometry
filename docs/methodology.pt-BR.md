@@ -8,15 +8,17 @@
 
 A Lia é um pipeline de pré-triagem de candidatos a objetos em movimento em sequências de imagens FITS do IASC/Pan-STARRS. Ela foi desenvolvida para reduzir o esforço de inspeção manual antes da revisão no Astrometrica. **Não substitui** o Astrometrica, a validação pelo MPC nem o fluxo oficial do IASC.
 
-## Contexto Para Iniciantes
+## Contexto Para O Público Geral
 
-O International Astronomical Search Collaboration (IASC) é um programa de ciência cidadã em que equipes inspecionam conjuntos de imagens astronômicas e submetem medições validadas por meio de um fluxo oficial de campanha. A NASA lista o IASC como um projeto de ciência cidadã da NASA Science, e a página de colaboradores do IASC lista a NASA entre os colaboradores dos Estados Unidos. As campanhas do IASC são pensadas para que estudantes e pessoas sem especialização técnica possam participar após treinamento, geralmente inspecionando pacotes de quatro imagens no Astrometrica.
+O International Astronomical Search Collaboration (IASC) é um projeto de ciência cidadã da NASA Science em que equipes inspecionam conjuntos de imagens astronômicas e submetem medições validadas de asteroides por meio de um fluxo oficial de campanha.
+
+Os dados de imagem usados nas campanhas gerais de caça a asteroides do IASC são dados observacionais de telescópio. O IASC informa que os conjuntos de imagens de campanha são fornecidos pelo Institute for Astronomy da University of Hawaii e obtidos com o telescópio Pan-STARRS de 1,8 m em Haleakalā. O telescópio fotografa campos ao longo da eclíptica, onde a maioria dos asteroides é encontrada. A Lia foi construída para essas observações FITS reais distribuídas em campanhas no estilo IASC; ela não é voltada para imagens geradas por IA, ilustrações ou imagens sintéticas, exceto em testes controlados de software.
 
 Em um conjunto típico do IASC, o mesmo campo do céu é fotografado quatro vezes. Estrelas e galáxias ficam praticamente fixas nesse intervalo curto. Objetos do Sistema Solar, como candidatos a asteroides do cinturão principal, podem aparecer como pequenas fontes pontuais que mudam de posição de um frame para outro. A tarefa é separar movimento coerente real de ruído, pixels saturados, raios cósmicos, blends, pixels ruins e outros artefatos de imagem.
 
 A Lia ajuda na primeira triagem. Ela não decide se uma descoberta é real. Em vez disso, entrega ao observador uma lista menor e ranqueada de pontos para revisar manualmente. Isso é útil para equipes escolares e estudantis porque reduz a busca repetitiva sem remover a etapa de validação humana exigida pelo fluxo de campanha.
 
-## Fluxo Recomendado Para Estudantes
+## Fluxo Recomendado Para Participantes Do IASC
 
 1. Baixe o conjunto FITS do IASC e leia as instruções da campanha.
 2. Rode a Lia nos quatro frames FITS.
@@ -32,14 +34,14 @@ O texto em estilo MPC gerado pela Lia é um rascunho auxiliar para revisão e au
 
 | Arquivo | Para que serve |
 |---|---|
-| `*_report.txt` | Resumo legível dos candidatos. Comece por ele se você é iniciante. |
+| `*_report.txt` | Resumo legível dos candidatos. Este é o melhor ponto de partida para a maioria dos usuários. |
 | `*_candidates.png` | Recortes visuais mostrando a posição dos candidatos nos quatro frames. |
 | `*_candidates.json` | Dados estruturados para reprodutibilidade, auditoria e análises futuras. |
 | `*_MPC_report.txt` | Texto auxiliar em estilo MPC, apenas para revisão. |
 | `*_pipeline.log` | Log da execução com detalhes de WCS, Gaia, SkyBot e processamento. |
 | `validation_metrics_*.csv` | Tabelas para comparar a saída da Lia com resultados posteriores do Astrometrica/IASC. |
 
-Para iniciantes, o fluxo mais prático é abrir `*_report.txt` e `*_candidates.png`, inspecionar primeiro candidatos marcados como `STRONG`, e depois seguir para `MODERATE` e `WEAK` apenas se houver tempo.
+Para a maioria dos usuários, o fluxo mais prático é abrir `*_report.txt` e `*_candidates.png`, inspecionar primeiro candidatos marcados como `STRONG`, e depois seguir para `MODERATE` e `WEAK` apenas se houver tempo.
 
 ## Etapas do Pipeline
 

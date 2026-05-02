@@ -19,15 +19,17 @@ A Lia é uma ferramenta de apoio. Ela **não** confirma descobertas de asteroide
 
 Asteroides são pequenos corpos rochosos que sobraram da formação do Sistema Solar. Encontrar e medir asteroides ajuda astrônomos a melhorar órbitas, identificar novos objetos do cinturão principal e apoiar o trabalho de defesa planetária relacionado a objetos próximos da Terra.
 
-O **International Astronomical Search Collaboration (IASC)** é um programa de ciência cidadã em que equipes inspecionam imagens de telescópios profissionais e submetem medições validadas por meio de um processo oficial de campanha. A NASA lista o IASC como um projeto de ciência cidadã da NASA Science, e a página de colaboradores do IASC lista a NASA entre os colaboradores dos Estados Unidos.
+O **International Astronomical Search Collaboration (IASC)** é um projeto de ciência cidadã da NASA Science em que equipes inspecionam imagens de telescópios profissionais e submetem medições validadas de asteroides por meio de um processo oficial de campanha.
+
+Nas campanhas gerais de caça a asteroides, os conjuntos de imagens do IASC são enviados às equipes participantes pelos organizadores da campanha. Segundo o IASC, essas imagens são fornecidas pelo Institute for Astronomy da University of Hawaii e obtidas com o telescópio Pan-STARRS de 1,8 m em Haleakalā, ao longo da eclíptica, onde muitos asteroides são encontrados. São observações reais de telescópio, não imagens geradas por IA nem imagens sintéticas.
 
 As campanhas do IASC são importantes porque permitem que estudantes e pessoas sem formação técnica avancada participem de trabalho astronômico real. A Lia foi criada para facilitar a primeira triagem sem esconder a necessidade de validação humana cuidadosa.
 
-Fontes: [página do IASC na NASA Science](https://science.nasa.gov/citizen-science/international-astronomical-search-collaboration/) e [página de colaboradores do IASC](https://iasc.cosmosearch.org/Home/Collaborators).
+Fontes: [página do IASC na NASA Science](https://science.nasa.gov/citizen-science/international-astronomical-search-collaboration/) e [registro de campanhas do IASC](https://iasc.cosmosearch.org/Home/Registration).
 
 ## O Que A Lia Faz
 
-Conjuntos de prática e campanha do IASC/Pan-STARRS geralmente contêm quatro imagens FITS do mesmo campo do céu. A maioria das estrelas fica parada de um frame para outro; possíveis asteroides se deslocam um pouco.
+Conjuntos de prática e campanha do IASC/Pan-STARRS geralmente contêm quatro frames FITS reais do mesmo campo do céu. A maioria das estrelas fica parada de um frame para outro; possíveis asteroides se deslocam um pouco.
 
 A Lia:
 
@@ -164,6 +166,7 @@ lia-astrometry/
 
 - [NASA Science: International Astronomical Search Collaboration](https://science.nasa.gov/citizen-science/international-astronomical-search-collaboration/)
 - [Site oficial do IASC](https://iasc.cosmosearch.org/)
+- [Registro de campanhas do IASC](https://iasc.cosmosearch.org/Home/Registration)
 - [Colaboradores do IASC](https://iasc.cosmosearch.org/Home/Collaborators)
 - Gaia Collaboration et al. (2023), *Gaia Data Release 3*, Astronomy & Astrophysics, 674, A1.
 - Stetson, P. B. (1987), *DAOPHOT: A Computer Program for Crowded-Field Stellar Photometry*, PASP, 99, 191.
