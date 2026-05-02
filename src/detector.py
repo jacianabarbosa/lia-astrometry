@@ -1512,11 +1512,11 @@ def find_movers(frames: list[dict], sigma: float = 5.5) -> tuple[list[dict], dic
         movers = []
 
     metrics = {
-        "n_fontes_by_frame"        : n_fontes_by_frame,
+        "n_sources_by_frame"       : n_fontes_by_frame,
         "n_tracks_attempted"        : n_tracks_attempted,
         "drift_dx_px"              : round(deriva_dx, 3),
         "drift_dy_px"              : round(deriva_dy, 3),
-        "n_estaveis_deriva"         : n_estaveis,
+        "n_drift_stable_sources"   : n_estaveis,
         "sigma"            : sigma,
         "background_model"          : "photutils.Background2D",
         "background_box_size"       : list(T.BACKGROUND_BOX),
@@ -1524,7 +1524,7 @@ def find_movers(frames: list[dict], sigma: float = 5.5) -> tuple[list[dict], dic
         "psf_model"                 : T.PSF_MODEL,
         "psf_fwhm_range_px"         : [T.FWHM_MIN_PX, T.FWHM_MAX_PX],
         "multiprocessing_processes" : min(4, len(frames), os.cpu_count() or 1),
-        "saturacao_pct_by_frame"   : [round(f.get("sat_pct", 0.0), 2) for f in frames],
+        "saturation_pct_by_frame"  : [round(f.get("sat_pct", 0.0), 2) for f in frames],
         "gaia_refinement"          : [
             {
                 "frame"               : f["file"],
@@ -1534,10 +1534,10 @@ def find_movers(frames: list[dict], sigma: float = 5.5) -> tuple[list[dict], dic
                 "n_matches"           : f.get("gaia_n_matches", 0),
                 "coarse_matches"     : f.get("gaia_coarse_matches", 0),
                 "coarse_offset_arcsec" : f.get("gaia_coarse_offset_arcsec", [0.0, 0.0]),
-                "n_matches_fino"      : f.get("gaia_refined_matches", 0),
-                "n_matches_ajuste"    : f.get("gaia_n_matches_ajuste", 0),
-                "n_matches_usados"    : f.get("gaia_n_matches_usados", 0),
-                "match_origem"        : f.get("gaia_match_origem"),
+                "fine_matches"        : f.get("gaia_refined_matches", 0),
+                "fit_matches"         : f.get("gaia_n_matches_ajuste", 0),
+                "used_matches"        : f.get("gaia_n_matches_usados", 0),
+                "match_source"        : f.get("gaia_match_origem"),
             }
             for f in frames
         ],
@@ -1789,13 +1789,13 @@ def _calculate_astrometric_uncertainties(
                                       if sigma_centroid is not None else None,
             "sigma_wcs_arcsec": round(sigma_wcs, 4) if sigma_wcs is not None else None,
             "sigma_pos_arcsec": round(sigma_pos, 4) if sigma_pos is not None else None,
-            "metodo": "FWHM/(2.355*SNR) combinado em quadratura com RMS Gaia",
+            "method": "FWHM/(2.355*SNR) combined in quadrature with Gaia RMS",
         })
 
     return {
         "by_frame": by_frame,
-        "sigma_pos_mediana_arcsec": round(float(np.median(sigma_total)), 4)
-                                    if sigma_total else None,
+        "median_position_sigma_arcsec": round(float(np.median(sigma_total)), 4)
+                                        if sigma_total else None,
     }
 
 
@@ -2091,13 +2091,7 @@ def analyze_candidate(c: dict, frames: list[dict]) -> dict:
         "score_normalized"      : round(score / score_max, 4),
         "heuristic_score"       : score,
         "priority_score"        : score,
-        "triage_class"                : triage_class,
-        "triage_class"          : {
-            "STRONG": "STRONG",
-            "MODERATE": "MODERATE",
-            "WEAK": "WEAK",
-            "DISCARDED": "DISCARDED",
-        }.get(triage_class, triage_class),
+        "triage_class"          : triage_class,
         "cli_color"               : cli_color,
         "flags"                 : flags,
         "penalty_reasons"    : penalty_reasons,
@@ -2521,6 +2515,56 @@ def _diagnostic_summary(c: dict) -> str:
     return "; ".join(parts) + "."
 
 
+def _display_flag(flag: str) -> str:
+    """English label for internal diagnostic flags."""
+    mapping = {
+        "LINEARIDADE_BOA": "GOOD_LINEARITY",
+        "LINEARIDADE_RUIM": "POOR_LINEARITY",
+        "VELOCIDADE_CONSISTENTE": "CONSISTENT_VELOCITY",
+        "VELOCIDADE_IRREGULAR": "IRREGULAR_VELOCITY",
+        "BRILHO_ESTAVEL": "STABLE_BRIGHTNESS",
+        "BRILHO_INSTAVEL": "UNSTABLE_BRIGHTNESS",
+        "MORFOLOGIA_PONTUAL": "POINT_SOURCE",
+        "MORFOLOGIA_ESTENDIDA": "EXTENDED_MORPHOLOGY",
+        "ELONGACAO_ALTA": "HIGH_ELONGATION",
+        "MORFO_INCONSISTENTE": "INCONSISTENT_MORPHOLOGY",
+        "GAIA_FONTE_ESTATICA": "GAIA_STATIC_SOURCE",
+        "MPC_SEM_MATCH": "MPC_NO_MATCH",
+        "MPC_MATCH_PROVAVEL": "MPC_LIKELY_MATCH",
+        "MPC_MATCH_AMBIGUO": "MPC_AMBIGUOUS_MATCH",
+        "MPC_CONSULTA_FALHOU": "MPC_QUERY_FAILED",
+    }
+    return mapping.get(flag, flag)
+
+
+def _display_reason(text: str) -> str:
+    """Translate common internal diagnostic snippets for human reports."""
+    replacements = {
+        "REJEITADO": "REJECTED",
+        "razão(ões) adicionais": "additional reason(s)",
+        "linearity ruim": "poor linearity",
+        "velocity uniforme": "uniform velocity",
+        "flux estável": "stable flux",
+        "flux moderadamente variável": "moderately variable flux",
+        "flux instável": "unstable flux",
+        "elongação elevada": "high elongation",
+        "penalização(ões) de score": "score penalty(ies)",
+        "múltiplos objects no cone SkyBot — verificar": "multiple objects in SkyBot cone - review",
+        "posição na borda do frame": "position near frame edge",
+        "morphology estendida": "extended morphology",
+        "morphology inconsistente entre frames": "inconsistent morphology across frames",
+        "velocity irregular": "irregular velocity",
+        "fonte estática Gaia": "Gaia static source",
+        "compatível com source estática Gaia": "compatible with Gaia static source",
+        "posição na borda": "position near edge",
+        "SNR insuficiente": "insufficient SNR",
+        "FWHM incompatível": "incompatible FWHM",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    return text
+
+
 def generate_text_report(candidates: list[dict], frames: list[dict],
                         input_set_name: str, output_dir: Path,
                         global_metrics: dict) -> Path:
@@ -2537,15 +2581,15 @@ def generate_text_report(candidates: list[dict], frames: list[dict],
     # ── Cabeçalho ──────────────────────────────────────────────────────────
     lines += [
         sep,
-        "  Lia — Analysis Report",
-        f"  Versão do pipeline   : {PIPELINE_VERSION}",
-        f"  Data de processamento: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"  Conjunto de images  : {input_set_name}",
-        f"  Modo WCS             : {wcs_mode.upper()}",
+        "  Lia - Analysis Report",
+        f"  Pipeline version     : {PIPELINE_VERSION}",
+        f"  Processing time      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  Input set            : {input_set_name}",
+        f"  WCS mode             : {wcs_mode.upper()}",
         f"  run_id               : {run_id}",
-        f"  Observatório         : Pan-STARRS / IASC (código F51)",
-        f"  Data de observação   : {frames[0]['date_obs'][:10]}",
-        f"  Intervalo temporal   : {frames[0]['date_obs'][11:19]} → "
+        f"  Observatory          : Pan-STARRS / IASC (F51)",
+        f"  Observation date     : {frames[0]['date_obs'][:10]}",
+        f"  Time span            : {frames[0]['date_obs'][11:19]} -> "
         f"{frames[-1]['date_obs'][11:19]} UTC",
         sep, "",
     ]
@@ -2555,23 +2599,23 @@ def generate_text_report(candidates: list[dict], frames: list[dict],
     lines += [
         "  PROCESSED SET METRICS",
         sub,
-        f"  Modo WCS             : {wcs_mode.upper()}",
+        f"  WCS mode             : {wcs_mode.upper()}",
         f"  run_id               : {run_id}",
-        f"  Frames válidos       : {mg.get('n_valid_frames', 4)} de 4",
-        f"  Sigma de detecção    : {mg.get('sigma', '?')}",
-        f"  Fontes detectadas    : " +
+        f"  Valid frames         : {mg.get('n_valid_frames', 4)} of 4",
+        f"  Detection sigma      : {mg.get('sigma', '?')}",
+        f"  Detected sources     : " +
         "  |  ".join(
-            f"F{i+1}={n}" for i, n in enumerate(mg.get("n_fontes_by_frame", []))
+            f"F{i+1}={n}" for i, n in enumerate(mg.get("n_sources_by_frame", []))
         ),
-        f"  Trilhas tentadas     : {mg.get('n_tracks_attempted', '?')}",
+        f"  Tracks attempted     : {mg.get('n_tracks_attempted', '?')}",
         f"  Unique candidates    : {mg.get('n_unique_candidates', '?')}",
-        f"  Rejeitados FP        : {mg.get('n_rejected_false_positive', '?')}",
-        f"  Deriva do field      : dx={mg.get('drift_dx_px', 0):+.2f} px  "
+        f"  FP rejected          : {mg.get('n_rejected_false_positive', '?')}",
+        f"  Field drift          : dx={mg.get('drift_dx_px', 0):+.2f} px  "
         f"dy={mg.get('drift_dy_px', 0):+.2f} px  "
-        f"[{mg.get('n_estaveis_deriva', '?')} estrelas]",
-        f"  Tempo de execução    : {mg.get('execution_time_s', '?')} s",
+        f"[{mg.get('n_drift_stable_sources', '?')} stable sources]",
+        f"  Execution time       : {mg.get('execution_time_s', '?')} s",
         "", sub,
-        f"  Total candidates    : {len(candidates)}",
+        f"  Total candidates     : {len(candidates)}",
         f"  STRONG    (8-12) : {sum(1 for c in candidates if c['triage_class']=='STRONG')}",
         f"  MODERATE (6-7)  : {sum(1 for c in candidates if c['triage_class']=='MODERATE')}",
         f"  WEAK    (4-5)  : {sum(1 for c in candidates if c['triage_class']=='WEAK')}",
@@ -2596,23 +2640,23 @@ def generate_text_report(candidates: list[dict], frames: list[dict],
     ]
 
     grupos = {
-        "INSPECIONAR PRIMEIRO"      : [],
-        "INSPECIONAR SE HOUVER TEMPO": [],
+        "INSPECT FIRST"      : [],
+        "INSPECT IF TIME ALLOWS": [],
         "LIKELY ARTIFACT"         : [],
-        "IGNORAR"                   : [],
+        "IGNORE"                   : [],
     }
     for c in candidates:
         cl = c["triage_class"]
         mpc_status = c.get("mpc", {}).get("status", "not_queried")
         borda = "EDGE_FRAME" in c.get("flags", [])
         if cl == "STRONG" and mpc_status in ("no_match", "not_queried"):
-            grupos["INSPECIONAR PRIMEIRO"].append(c)
+            grupos["INSPECT FIRST"].append(c)
         elif cl in ("STRONG", "MODERATE"):
-            grupos["INSPECIONAR SE HOUVER TEMPO"].append(c)
+            grupos["INSPECT IF TIME ALLOWS"].append(c)
         elif cl == "WEAK":
             grupos["LIKELY ARTIFACT"].append(c)
         else:
-            grupos["IGNORAR"].append(c)
+            grupos["IGNORE"].append(c)
 
     rank_global = {c["rank"]: c for c in candidates if "rank" in c}
 
@@ -2622,16 +2666,16 @@ def generate_text_report(candidates: list[dict], frames: list[dict],
         lines += [f"  ┌─ {group_name} ({len(group_candidates)}) "]
         for c in group_candidates:
             rank_label = f"#{c.get('rank', '?')}"
-            flags_str  = "  ".join(c.get("flags", []))
-            resumo     = _diagnostic_summary(c)
+            flags_str  = "  ".join(_display_flag(f) for f in c.get("flags", []))
+            resumo     = _display_reason(_diagnostic_summary(c))
             lines += [
                 f"  │  {rank_label}  score {c['score']}/{c.get('score_max', 12)}  {c['triage_class']}",
                 f"  │     Lin={c['score_linearity']}/3  "
                 f"Vel={c['score_velocity']}/2  "
-                f"Fot={c['score_photometry']}/2  "
-                f"Mor={c['score_morphology']}/2  "
-                f"Faixa={c['score_velocity_range']}/1",
-                f"  │     Flags: {flags_str if flags_str else '—'}",
+                f"Phot={c['score_photometry']}/2  "
+                f"Morph={c['score_morphology']}/2  "
+                f"Range={c['score_velocity_range']}/1",
+                f"  │     Flags: {flags_str if flags_str else '-'}",
                 f"  │     {resumo}",
                 f"  │",
             ]
@@ -2641,7 +2685,7 @@ def generate_text_report(candidates: list[dict], frames: list[dict],
     lines += [sep, ""]
 
     # ── Detalhamento por candidate ─────────────────────────────────────────
-    lines += ["  DETALHAMENTO POR CANDIDATO", sub, ""]
+    lines += ["  CANDIDATE DETAILS", sub, ""]
 
     for c in candidates:
         if c["triage_class"] == "DISCARDED":
@@ -2666,17 +2710,17 @@ def generate_text_report(candidates: list[dict], frames: list[dict],
             )
         elif mpc_status == "ambiguous_match":
             status_mpc_txt = (
-                f"MATCH AMBÍGUO — {mpc.get('n_objects_in_cone', '?')} "
-                "objects no cone de busca"
+                f"AMBIGUOUS MATCH - {mpc.get('n_objects_in_cone', '?')} "
+                "objects in search cone"
             )
         elif mpc_status == "no_match":
-            status_mpc_txt = "SEM CORRESPONDÊNCIA no cone de 2'"
+            status_mpc_txt = "NO MATCH in 2 arcmin cone"
         elif mpc_status == "query_failed":
-            status_mpc_txt = f"CONSULTA FALHOU — {mpc.get('reason', '')}"
+            status_mpc_txt = f"QUERY FAILED - {mpc.get('reason', '')}"
         else:
             status_mpc_txt = "Not queried (offline mode)"
 
-        flags_str = "  ".join(c.get("flags", [])) or "—"
+        flags_str = "  ".join(_display_flag(f) for f in c.get("flags", [])) or "-"
 
         # Razões de decisão
         razoes_rej = c.get("rejection_reasons", [])
@@ -2684,77 +2728,77 @@ def generate_text_report(candidates: list[dict], frames: list[dict],
         score_max  = c.get("score_max", 12)
 
         lines += [
-            f"  CANDIDATO #{c.get('rank', '?'):02}  [{c.get('candidate_id', '?')}]",
+            f"  CANDIDATE #{c.get('rank', '?'):02}  [{c.get('candidate_id', '?')}]",
             sub,
             f"  Classification    : {c['triage_class']}  "
             f"(score {c['score']}/{score_max}  |  normalized {c['score_percent']}%)",
             f"  Flags            : {flags_str}",
-            f"  Diagnostic      : {_diagnostic_summary(c)}",
+            f"  Diagnostic      : {_display_reason(_diagnostic_summary(c))}",
         ]
 
         if razoes_rej:
             lines.append(f"  ── Rejection reasons ───────────────────────────────────")
             for r in razoes_rej:
-                lines.append(f"  ✗  {r}")
+                lines.append(f"  X  {_display_reason(r)}")
 
         if razoes_pen:
             lines.append(f"  ── Penalty reasons ────────────────────────────────")
             for r in razoes_pen:
-                lines.append(f"  ↓  {r}")
+                lines.append(f"  -  {_display_reason(r)}")
 
         lines += [
             "",
-            f"  ── Decomposição do score ────────────────────────────────────",
-            f"  Linearidade        : {c['score_linearity']}/3  "
-            f"(resíduo {c['linearity']:.3f} px)",
-            f"  Velocidade         : {c['score_velocity']}/2  "
-            f"(σ passos {c['vel_consistencia']:.3f})",
-            f"  Fotometria         : {c['score_photometry']}/2  "
+            f"  -- Score breakdown -----------------------------------------",
+            f"  Linearity          : {c['score_linearity']}/3  "
+            f"(residual {c['linearity']:.3f} px)",
+            f"  Velocity           : {c['score_velocity']}/2  "
+            f"(step sigma {c['vel_consistencia']:.3f})",
+            f"  Photometry         : {c['score_photometry']}/2  "
             f"(CV flux {c['flux_cv']:.3f})",
-            f"  Morfologia         : {c['score_morphology']}/2  "
-            f"(pointness média {c['pointlike']:.4f})",
-            f"  Consist. morfológ. : {c.get('score_morph_consistency', '?')}/1  "
+            f"  Morphology         : {c['score_morphology']}/2  "
+            f"(mean pointness {c['pointlike']:.4f})",
+            f"  Morph. consistency : {c.get('score_morph_consistency', '?')}/1  "
             f"(std pointness {c.get('pont_std', 0.0):.4f})",
             f"  Elongation         : {c.get('score_elongation', '?')}/1  "
-            f"(elongação média {c.get('mean_elongation', 1.0):.2f})",
-            f"  Faixa vel. típica  : {c['score_velocity_range']}/1  "
+            f"(mean elongation {c.get('mean_elongation', 1.0):.2f})",
+            f"  Typical velocity   : {c['score_velocity_range']}/1  "
             f"({c['move_total']:.1f} px total)",
-            f"  Score total        : {c['score']}/{score_max}",
+            f"  Total score        : {c['score']}/{score_max}",
             "",
             f"  ── Position (Frame 1) ────────────────────────────────────────",
             f"  Pixel            : x={tx0:.1f}  y={ty0:.1f}",
-            f"  Coordenadas      : RA = {ra:.6f}°  Dec = {dec:.6f}°",
+            f"  Coordinates      : RA = {ra:.6f} deg  Dec = {dec:.6f} deg",
             f"  RA  (HH MM SS)   : {format_mpc_ra(ra)}",
             f"  Dec (±DD MM SS)  : {format_mpc_dec(dec)}",
             "",
-            f"  ── Movimento ────────────────────────────────────────────────",
-            f"  Deslocamento total : {c['move_total']:.2f} px",
+            f"  -- Motion ---------------------------------------------------",
+            f"  Total displacement : {c['move_total']:.2f} px",
             f"  Direction (dx, dy)   : ({track[-1][1]-track[0][1]:.1f}, "
             f"{track[-1][0]-track[0][0]:.1f}) px",
         ]
 
         if c.get("vel_arcsec_min") is not None:
-            lines.append(f"  Velocidade angular : {c['vel_arcsec_min']:.2f} arcsec/min")
+            lines.append(f"  Angular rate       : {c['vel_arcsec_min']:.2f} arcsec/min")
 
         fwhm_str = (f"{c['mean_fwhm_px']:.1f} px"
                     if c.get("mean_fwhm_px") is not None else "n/d")
         lines += [
             "",
-            f"  ── Fotometria e Morfologia ──────────────────────────────────",
-            f"  Brilho por frame  : {[round(b, 1) for b in c['fluxes']]}",
-            f"  SNR estimado      : {[round(s, 1) for s in c.get('snrs', [])]}",
+            f"  -- Photometry and morphology -------------------------------",
+            f"  Flux by frame     : {[round(b, 1) for b in c['fluxes']]}",
+            f"  Estimated SNR     : {[round(s, 1) for s in c.get('snrs', [])]}",
             f"  Variation (CV)     : {c['flux_cv']:.3f}  "
-            + ("✓ estável" if c["flux_cv"] < T.PHOT_STABLE else "! variável"),
+            + ("OK stable" if c["flux_cv"] < T.PHOT_STABLE else "! variable"),
             f"  Perfil pointlike    : {c['pointlike']:.4f}  "
-            + ("✓ ponto" if c["pointlike"] > T.MOR_MARGINAL else "! estendido"),
+            + ("OK point-like" if c["pointlike"] > T.MOR_MARGINAL else "! extended"),
             f"  Mean elongation   : {c.get('mean_elongation', 1.0):.2f}  "
-            + ("✓" if c.get("mean_elongation", 1.0) < T.ELON_GOOD else "! estendida"),
-            f"  FWHM estimada     : {fwhm_str}",
+            + ("OK" if c.get("mean_elongation", 1.0) < T.ELON_GOOD else "! extended"),
+            f"  Estimated FWHM    : {fwhm_str}",
             "",
             f"  ── Status MPC/SkyBot ────────────────────────────────────────",
             f"  {status_mpc_txt}",
             "",
-            f"  ── Trilha frame a frame ─────────────────────────────────────",
+            f"  -- Frame-by-frame track ------------------------------------",
         ]
         for fi, t in enumerate(track):
             if frames[fi]["wcs_ok"]:
@@ -2874,16 +2918,15 @@ def export_json(candidates: list[dict], frames: list[dict],
       flags, status MPC normalizado, colunas manuais vazias para avaliação
     """
     if run_metadata is None:
+        timestamp_execution_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
         run_metadata = {
             "run_id"           : "n/a",
             "pipeline_name"    : PROJECT_NAME,
             "pipeline_version" : PIPELINE_VERSION,
             "repository"       : REPOSITORY_NAME,
             "wcs_mode"         : global_metrics.get("wcs_mode", "gaia"),
-            "timestamp_execution_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "timestamp_execution_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "timestamp_execution_utc": timestamp_execution_utc,
             "input_set"        : str(output_dir),
-            "input_set_name"    : input_set_name,
             "input_set_name"   : input_set_name,
             "sigma"            : global_metrics.get("sigma"),
             "observer"       : {},
@@ -2894,15 +2937,12 @@ def export_json(candidates: list[dict], frames: list[dict],
         "pipeline"       : f"{PROJECT_NAME} v{PIPELINE_VERSION}",
         "pipeline_name"  : PROJECT_NAME,
         "repository"     : REPOSITORY_NAME,
-        "input_set"       : input_set_name,
         "input_set"      : input_set_name,
-        "processado_em"  : datetime.now().isoformat(timespec="seconds"),
+        "processed_at"   : datetime.now().isoformat(timespec="seconds"),
         "observatory"   : "Pan-STARRS / IASC (F51)",
         "data_obs"       : frames[0]["date_obs"][:10],
         "run_metadata"   : run_metadata,
-        "global_metrics": global_metrics,
         "global_metrics" : global_metrics,
-        "candidates"     : [],
         "candidates"     : [],
     }
 
@@ -2941,7 +2981,7 @@ def export_json(candidates: list[dict], frames: list[dict],
                 "morph_consistency": c.get("score_morph_consistency", 0),
                 "elongation"        : c.get("score_elongation", 0),
                 "velocity_range"         : c["score_velocity_range"],
-                "maximos"           : {
+                "maxima"           : {
                     "linearity": 3, "velocity": 2, "photometry": 2,
                     "morphology": 2, "morph_consistency": 1,
                     "elongation": 1, "velocity_range": 1,
@@ -2952,17 +2992,13 @@ def export_json(candidates: list[dict], frames: list[dict],
             "flags"             : c.get("flags", []),
 
             # Razões de decisão auditáveis
-            "decision_reasons"    : {
-                "penalties" : c.get("penalty_reasons", []),
-                "rejections"    : c.get("rejection_reasons", []),
-            },
             "decision_reasons"  : {
                 "penalties": c.get("penalty_reasons", []),
                 "rejections": c.get("rejection_reasons", []),
             },
 
             # Position resumida (frame 1)
-            "posicao_frame1"    : {
+            "frame1_position"    : {
                 "pixel_x" : round(tx0, 2),
                 "pixel_y" : round(ty0, 2),
                 "ra_deg"  : ra_r,
@@ -2972,15 +3008,6 @@ def export_json(candidates: list[dict], frames: list[dict],
             },
 
             # Métricas de motion
-            "motion"         : {
-                "total_px"        : round(c["move_total"], 3),
-                "residuo_deriva"  : round(c.get("residual", 0.0), 3),
-                "linearidade_px"  : round(c["linearity"], 4),
-                "linear_r2"       : round(c["linear_r2"], 6)
-                                    if c.get("linear_r2") is not None else None,
-                "vel_consistencia": round(c["vel_consistencia"], 4),
-                "vel_arcsec_min"  : c.get("vel_arcsec_min"),
-            },
             "motion"            : {
                 "total_px": round(c["move_total"], 3),
                 "field_drift_residual_px": round(c.get("residual", 0.0), 3),
@@ -2992,15 +3019,6 @@ def export_json(candidates: list[dict], frames: list[dict],
             },
 
             # Fotometria e morphology
-            "photometry"        : {
-                "flux_by_frame": [round(b, 1) for b in c["fluxes"]],
-                "flux_cv"       : round(c["flux_cv"], 4)
-                                    if c["flux_cv"] != float("inf") else None,
-                "pointness"    : round(c["pointlike"], 5),
-                "pont_std"        : round(c.get("pont_std", 0.0), 5),
-                "snr_by_frame"   : [round(s, 2) if s is not None else None
-                                     for s in c.get("snrs", [])],
-            },
             "photometry"        : {
                 "flux_by_frame": [round(b, 1) for b in c["fluxes"]],
                 "flux_cv": round(c["flux_cv"], 4)
@@ -3040,13 +3058,6 @@ def export_json(candidates: list[dict], frames: list[dict],
             "mpc"               : c.get("mpc", {"status": "not_queried"}),
 
             # Colunas de avaliação manual — preencher após inspeção no Astrometrica/IASC
-            "manual_validation"  : {
-                "medido_astrometrica"  : None,
-                "entrou_mpc"          : None,
-                "feedback_iasc"       : None,
-                "classificacao_manual": None,
-                "observacoes"         : None,
-            },
             "manual_validation" : {
                 "measured_in_astrometrica"      : None,
                 "included_in_astrometrica_mpc" : None,
@@ -3055,7 +3066,6 @@ def export_json(candidates: list[dict], frames: list[dict],
                 "notes"                        : None,
             },
         }
-        output["candidates"].append(entry)
         output["candidates"].append(entry)
 
     json_file = output_dir / f"{input_set_name}_candidates.json"
@@ -3223,6 +3233,7 @@ def main():
         "execution_time_s"         : round(t_fim - t_inicio, 1),
     })
 
+    timestamp_execution_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     run_metadata = {
         "run_id"              : run_id,
         "pipeline_name"       : PROJECT_NAME,
@@ -3230,10 +3241,8 @@ def main():
         "repository"          : REPOSITORY_NAME,
         "wcs_mode"            : args.wcs_mode,
         "sigma"               : args.sigma,
-        "timestamp_execution_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "timestamp_execution_utc"  : datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "timestamp_execution_utc": timestamp_execution_utc,
         "input_set"           : str(images_dir.resolve()),
-        "input_set_name"      : input_set_name,
         "input_set_name"       : input_set_name,
         "observer"          : observer,
     }

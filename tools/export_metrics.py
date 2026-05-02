@@ -13,26 +13,26 @@ Usage:
 The CSV files include empty manual-review columns for later Astrometrica and
 IASC campaign validation.
 
-Campos exportados por input_set:
+Fields exported per input set:
     run_id, input_set, pipeline_version, wcs_mode, sigma,
-    n_fontes_F1..F4, n_tracks_attempted, n_unique_candidates,
-    n_rejected_false_positive, n_forte, n_moderado, n_fraco, n_descarta,
+    n_sources_F1..F4, n_tracks_attempted, n_unique_candidates,
+    n_rejected_false_positive, n_strong, n_moderate, n_weak, n_discarded,
     top1_candidate_id, top1_score, top1_class,
     top3_candidate_ids, top5_candidate_ids,
     gaia_status_F1..F4, gaia_rms_pre_F1..F4, gaia_rms_pos_F1..F4,
     gaia_n_matches_F1..F4, execution_time_s, data_obs, timestamp_execution_utc
 
-Campos exportados por candidate:
+Fields exported per candidate:
     candidate_id, run_id, input_set, wcs_mode, pipeline_version,
     rank, heuristic_score, score_max, triage_class, score_percent,
     s_linearity, s_velocity, s_photometry, s_morphology,
-    s_consist_morfo, s_elongation, s_faixa_vel,
+    s_morph_consistency, s_elongation, s_velocity_range,
     flags, ra_deg, dec_deg, vel_arcsec_min, move_total_px,
-    linearidade_px, vel_consistencia, flux_cv, pointness,
-    snr_medio, mean_fwhm_px, sigma_pos_mediana_arcsec,
+    linearity_residual_px, step_consistency_px, flux_cv, pointedness,
+    mean_snr, mean_fwhm_px, median_position_sigma_arcsec,
     mpc_status, gaia_static_status, n_rejections, n_penalties,
     rejection_reasons, penalty_reasons, data_obs,
-    --- colunas manuais (vazias) ---
+    --- manual columns (empty) ---
     measured_in_astrometrica, included_in_astrometrica_mpc, iasc_feedback,
     manual_classification, notes
 """
@@ -69,27 +69,26 @@ def process_json(path: Path) -> tuple[dict, list[dict]]:
             return _safe(gaia[idx].get(field), default)
         return default
 
-    n_fontes = mg.get("n_fontes_by_frame", [])
+    n_sources = mg.get("n_sources_by_frame") or mg.get("n_fontes_by_frame", [])
 
     set_row = {
         "run_id"             : _safe(rm.get("run_id") or mg.get("run_id")),
         "repository"         : _safe(rm.get("repository") or dados.get("repository")),
-        "input_set"          : _safe(dados.get("input_set") or dados.get("input_set")),
-        "input_set"           : _safe(dados.get("input_set")),
+        "input_set"          : _safe(dados.get("input_set")),
         "pipeline_version"   : _safe(rm.get("pipeline_version", dados.get("pipeline", ""))),
         "wcs_mode"           : _safe(rm.get("wcs_mode") or mg.get("wcs_mode")),
         "sigma"     : _safe(mg.get("sigma")),
-        "n_fontes_F1"        : n_fontes[0] if len(n_fontes) > 0 else "",
-        "n_fontes_F2"        : n_fontes[1] if len(n_fontes) > 1 else "",
-        "n_fontes_F3"        : n_fontes[2] if len(n_fontes) > 2 else "",
-        "n_fontes_F4"        : n_fontes[3] if len(n_fontes) > 3 else "",
+        "n_sources_F1"       : n_sources[0] if len(n_sources) > 0 else "",
+        "n_sources_F2"       : n_sources[1] if len(n_sources) > 1 else "",
+        "n_sources_F3"       : n_sources[2] if len(n_sources) > 2 else "",
+        "n_sources_F4"       : n_sources[3] if len(n_sources) > 3 else "",
         "n_tracks_attempted" : _safe(mg.get("n_tracks_attempted")),
         "n_unique_candidates": _safe(mg.get("n_unique_candidates")),
         "n_rejected_false_positive"    : _safe(mg.get("n_rejected_false_positive")),
-        "n_forte"            : _safe(mg.get("class_distribution", {}).get("STRONG")),
-        "n_moderado"         : _safe(mg.get("class_distribution", {}).get("MODERATE")),
-        "n_fraco"            : _safe(mg.get("class_distribution", {}).get("WEAK")),
-        "n_descarta"         : _safe(mg.get("class_distribution", {}).get("DISCARDED")),
+        "n_strong"           : _safe(mg.get("class_distribution", {}).get("STRONG")),
+        "n_moderate"         : _safe(mg.get("class_distribution", {}).get("MODERATE")),
+        "n_weak"             : _safe(mg.get("class_distribution", {}).get("WEAK")),
+        "n_discarded"        : _safe(mg.get("class_distribution", {}).get("DISCARDED")),
         "top1_candidate_id"  : _safe(mg.get("top1_candidate_id")),
         "top3_candidate_ids" : _join(mg.get("top3_candidate_ids", [])),
         "top5_candidate_ids" : _join(mg.get("top5_candidate_ids", [])),
@@ -133,11 +132,11 @@ def process_json(path: Path) -> tuple[dict, list[dict]]:
         motion  = c.get("motion", {})
         morph= c.get("morphology", {})
         inc  = c.get("astrometric_uncertainty", {})
-        pos1 = c.get("posicao_frame1", {})
+        pos1 = c.get("frame1_position") or c.get("posicao_frame1", {})
         mpc  = c.get("mpc", {})
         gs   = c.get("gaia_static", {})
         rd   = c.get("decision_reasons", {})
-        manual = c.get("manual_validation") or c.get("manual_validation", {})
+        manual = c.get("manual_validation", {})
 
         snrs = phot.get("snr_by_frame") or []
         snr_medio = ""
@@ -150,7 +149,6 @@ def process_json(path: Path) -> tuple[dict, list[dict]]:
             "candidate_id"           : _safe(c.get("candidate_id")),
             "run_id"                 : run_id,
             "input_set"              : input_set,
-            "input_set"               : input_set,
             "wcs_mode"               : wcs_mode,
             "pipeline_version"       : pv,
             "data_obs"               : data_obs,
@@ -158,28 +156,30 @@ def process_json(path: Path) -> tuple[dict, list[dict]]:
             "heuristic_score"        : _safe(c.get("heuristic_score", c.get("score_total"))),
             "score"                  : _safe(c.get("score_total")),
             "score_max"              : _safe(sc.get("score_max")),
-            "triage_class"           : _safe(c.get("triage_class", c.get("triage_class"))),
-            "triage_class"                 : _safe(c.get("triage_class")),
+            "triage_class"           : _safe(c.get("triage_class")),
             "score_percent"          : _safe(c.get("score_percent")),
             "s_linearity"          : _safe(sc.get("linearity")),
             "s_velocity"           : _safe(sc.get("velocity")),
             "s_photometry"           : _safe(sc.get("photometry")),
             "s_morphology"           : _safe(sc.get("morphology")),
-            "s_consist_morfo"        : _safe(sc.get("morph_consistency")),
+            "s_morph_consistency"    : _safe(sc.get("morph_consistency")),
             "s_elongation"           : _safe(sc.get("elongation")),
-            "s_faixa_vel"            : _safe(sc.get("velocity_range")),
+            "s_velocity_range"       : _safe(sc.get("velocity_range")),
             "flags"                  : _join(c.get("flags", [])),
             "ra_deg"                 : _safe(pos1.get("ra_deg")),
             "dec_deg"                : _safe(pos1.get("dec_deg")),
-            "vel_arcsec_min"         : _safe(motion.get("vel_arcsec_min")),
+            "vel_arcsec_min"         : _safe(motion.get("rate_arcsec_min") or motion.get("vel_arcsec_min")),
             "move_total_px"          : _safe(motion.get("total_px")),
-            "linearidade_px"         : _safe(motion.get("linearidade_px")),
-            "vel_consistencia"       : _safe(motion.get("vel_consistencia")),
+            "linearity_residual_px"  : _safe(motion.get("linearity_residual_px") or motion.get("linearidade_px")),
+            "step_consistency_px"    : _safe(motion.get("step_consistency_px") or motion.get("vel_consistencia")),
             "flux_cv"              : _safe(phot.get("flux_cv")),
-            "pointness"           : _safe(phot.get("pointness")),
-            "snr_medio"              : snr_medio,
+            "pointedness"            : _safe(phot.get("pointedness") or phot.get("pointness")),
+            "mean_snr"               : snr_medio,
             "mean_fwhm_px"          : _safe(morph.get("mean_fwhm_px")),
-            "sigma_pos_mediana_arcsec": _safe(inc.get("sigma_pos_mediana_arcsec")),
+            "median_position_sigma_arcsec": _safe(
+                inc.get("median_position_sigma_arcsec")
+                or inc.get("sigma_pos_mediana_arcsec")
+            ),
             "mpc_status"             : _safe(mpc.get("status")),
             "gaia_static_status"     : _safe(gs.get("status")),
             "n_rejections"            : len(rd.get("rejections", [])),
