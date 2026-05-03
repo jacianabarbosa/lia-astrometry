@@ -2,9 +2,9 @@
 
 # Lia
 
-**Lia** is a Python tool that helps students, teachers, and citizen-science teams pre-screen moving-object candidates in IASC FITS image sets before manual review in Astrometrica.
+**Lia** is a Python astrometric pre-screening pipeline for moving-object candidates in IASC/Pan-STARRS FITS sequences.
 
-It looks through a four-image sequence, detects point-like sources, searches for objects that move consistently against the fixed star background, ranks the candidates, and writes reports that can guide human inspection.
+The tool combines local background estimation, source detection, centroid refinement, Gaia DR3 astrometric adjustment, frame-to-frame tracking, and heuristic ranking to prioritize candidates before manual review in Astrometrica.
 
 Lia is a support tool. It does **not** confirm asteroid discoveries, replace Astrometrica, replace the Minor Planet Center (MPC), or replace the official IASC campaign workflow.
 
@@ -15,40 +15,136 @@ Lia is a support tool. It does **not** confirm asteroid discoveries, replace Ast
 - **Version:** `v1.5.0`
 - **License:** MIT
 
+---
+
+## Table Of Contents
+
+- [Overview](#overview)
+- [Why This Matters](#why-this-matters)
+- [Scientific Goal](#scientific-goal)
+- [What Lia Does](#what-lia-does)
+- [Methodology Summary](#methodology-summary)
+- [Example Output](#example-output)
+- [Quick Start](#quick-start)
+- [Basic Use](#basic-use)
+- [Astrometric Modes: Gaia And Header](#astrometric-modes-gaia-and-header)
+- [Generated Outputs](#generated-outputs)
+- [Understanding The Score](#understanding-the-score)
+- [Exporting Metrics](#exporting-metrics)
+- [Validation Plan](#validation-plan)
+- [Limitations](#limitations)
+- [More Documentation](#more-documentation)
+- [Project Structure](#project-structure)
+- [References](#references)
+- [License](#license)
+
+---
+
+## Overview
+
+Lia was created to support analysis of FITS sets used in asteroid-search campaigns, especially in the context of the **International Astronomical Search Collaboration (IASC)**.
+
+In a typical IASC set, four FITS images of the same sky field are acquired in sequence. Stars and galaxies remain nearly fixed over that short interval, while Solar System objects, such as asteroid candidates, can appear as point-like sources that shift slightly between frames.
+
+Lia processes those four frames, identifies sources, searches for coherent moving tracks, and generates a ranked candidate list for human inspection. The goal is not to replace the observer, but to reduce the initial search space and guide manual validation in Astrometrica.
+
+---
+
 ## Why This Matters
 
-Asteroids are small rocky bodies left over from the formation of the Solar System. Finding and measuring them helps astronomers improve orbits, identify new main-belt asteroids, and support planetary-defense work for near-Earth objects.
+Asteroids are small rocky bodies left over from the formation of the Solar System. Finding and measuring asteroids helps astronomers improve orbits, identify new main-belt objects, and support planetary-defense work related to near-Earth objects.
 
 The **International Astronomical Search Collaboration (IASC)** is a NASA Science citizen-science project where teams inspect professional telescope images and submit validated asteroid measurements through an official campaign process.
 
-For general asteroid-search campaigns, IASC image sets are supplied to participating teams by the campaign organizers. According to IASC, these images are provided by the Institute for Astronomy at the University of Hawaii and taken with the 1.8-m Pan-STARRS telescope on Haleakala, along the ecliptic where many asteroids are found. They are real telescope observations, not AI-generated images or synthetic pictures.
+For general asteroid-search campaigns, IASC image sets are sent to participating teams by the campaign organizers. According to IASC, these images are provided by the Institute for Astronomy at the University of Hawaii and acquired with the 1.8-m Pan-STARRS telescope on Haleakala, along the ecliptic, where many asteroids are found.
 
-IASC campaigns are especially valuable because they let students and non-specialists participate in real astronomical work. Lia is intended to make the first screening step easier without hiding the need for careful human validation.
+These are real telescope observations, not AI-generated images or synthetic pictures.
 
-Sources: [NASA Science IASC project page](https://science.nasa.gov/citizen-science/international-astronomical-search-collaboration/) and [IASC campaign registration](https://iasc.cosmosearch.org/Home/Registration).
+Lia was created to make the first screening pass easier for students, teachers, citizen-science teams, and observers who want to organize inspection before manual validation.
+
+Sources:
+
+- [NASA Science: International Astronomical Search Collaboration](https://science.nasa.gov/citizen-science/international-astronomical-search-collaboration/)
+- [IASC campaign registration](https://iasc.cosmosearch.org/Home/Registration)
+
+---
+
+## Scientific Goal
+
+Lia was developed to answer a practical question in the IASC campaign workflow:
+
+> Is it possible to reduce the number of candidates that must be inspected manually and prioritize objects that can be recovered, measured, and reported in Astrometrica?
+
+The pipeline does not try to confirm asteroids automatically. Its role is to:
+
+- reduce the initial search space;
+- prioritize candidates with plausible kinematic and morphological behavior;
+- generate auditable outputs;
+- support human inspection;
+- record metrics for later comparison with Astrometrica and, when available, IASC operational feedback.
+
+The scientific evaluation of Lia is based on the fraction of prioritized candidates that can be recovered, reviewed, measured, and eventually included in MPC reports generated by Astrometrica.
+
+---
 
 ## What Lia Does
 
-IASC/Pan-STARRS practice and campaign sets usually contain four real FITS frames of the same sky field. Most stars stay fixed from frame to frame; possible asteroids shift slightly.
+IASC/Pan-STARRS practice and campaign sets usually contain four real FITS frames of the same sky field.
 
 Lia:
 
 - loads the four FITS images;
-- masks saturated or invalid Pan-STARRS pixels;
+- masks saturated, invalid, or non-finite pixels;
 - estimates the local sky background;
 - detects point-like sources;
-- links detections across the four frames;
-- rejects obvious artifacts;
-- ranks the remaining candidates from `STRONG` to `DISCARDED`;
-- writes JSON, text, PNG, CSV-ready, and draft MPC-style outputs.
+- refines centroids with sub-pixel precision;
+- reconstructs the WCS from the FITS header;
+- optionally refines the astrometric solution with Gaia DR3;
+- associates detections across the four frames;
+- validates the kinematic coherence of tracks;
+- rejects or penalizes likely false positives;
+- classifies candidates from `STRONG` to `DISCARDED`;
+- queries nearby known objects through SkyBot/IMCCE when enabled;
+- generates JSON, text, PNG, CSV, and draft auxiliary MPC-style outputs.
 
-The result is a prioritized candidate list. A high score means “inspect this first”, not “this is a confirmed asteroid”.
+The result is a prioritized candidate list. A high score means:
+
+> "inspect this first"
+
+and not:
+
+> "this is a confirmed asteroid".
+
+---
+
+## Methodology Summary
+
+Lia processes each set as a short temporal sequence of four FITS frames.
+
+First, the pipeline reads the image data, preserves numerical precision in `float64`, extracts timing metadata, and reconstructs the WCS from the FITS header. When possible, the mid-exposure time is calculated and used as the temporal reference for candidate positions.
+
+Next, Lia estimates the local sky background with `Background2D`, which makes detection more robust in images with gradients, halos, masked regions, or local noise variation. Sources are detected with `DAOStarFinder` and can have their centroids refined through PSF/sub-pixel fitting.
+
+In `gaia` mode, Lia queries Gaia DR3, cross-matches reference stars with detected sources, and attempts to refine the astrometric solution. In `header` mode, the pipeline uses only the WCS reconstructed from the FITS header. This separation allows internal comparison of the impact of Gaia refinement without changing the rest of the pipeline.
+
+Detections are associated across the four frames to form candidate tracks. Each track is evaluated with kinematic, photometric, and morphological criteria, including motion linearity, velocity consistency between frames, brightness stability, point-source shape, elongation, FWHM, edge proximity, SNR, and possible artifacts or static sources.
+
+The final output is a ranked list of candidates for manual inspection in Astrometrica.
+
+The full methodology is available at:
+
+- [English methodology](docs/methodology.md)
+- [Metodologia em Portugues do Brasil](docs/methodology.pt-BR.md)
+
+---
 
 ## Example Output
 
 ![Example candidates](images/example_candidates.png)
 
-Each row is one candidate. The columns are the four frames in chronological order. Colored circles mark the measured centroid, and arrows show the motion direction.
+Each row represents one candidate. The columns show the four frames in chronological order. Circles mark the measured centroid, and arrows indicate the estimated motion direction.
+
+---
 
 ## Quick Start
 
@@ -64,7 +160,9 @@ venv/bin/python -m pip install -r requirements.txt
 venv/bin/python -m pytest tests/ -v
 ```
 
-The current test suite has 92 passing tests covering source detection, WCS handling, Gaia refinement, scoring, saturation masking, JSON traceability, and CSV export.
+The current suite has **92 passing tests**, covering source detection, WCS handling, Gaia refinement, scoring, saturation masking, JSON traceability, and CSV export.
+
+---
 
 ## Basic Use
 
@@ -80,7 +178,7 @@ Useful options:
 venv/bin/python src/detector.py --sigma 5.0       # more sensitive, more false positives
 venv/bin/python src/detector.py --sigma 6.5       # more conservative
 venv/bin/python src/detector.py --no-mpc          # skip SkyBot known-object lookup
-venv/bin/python src/detector.py --wcs-mode header # use reconstructed header WCS only
+venv/bin/python src/detector.py --wcs-mode header # use only the reconstructed header WCS
 venv/bin/python src/detector.py --wcs-mode gaia   # default: Gaia DR3 WCS refinement
 ```
 
@@ -88,89 +186,34 @@ Observer metadata can be passed directly or through environment variables:
 
 ```bash
 venv/bin/python src/detector.py --observer "Your Name" --email "name@example.com"
+
 export LIA_OBS="Your Name"
 export LIA_EMAIL="name@example.com"
 ```
 
-## Outputs
+---
 
-For each processed set, Lia writes:
+## Astrometric Modes: Gaia And Header
 
-- `*_candidates.json`: structured candidate data and run metadata;
-- `*_report.txt`: readable inspection report;
-- `*_MPC_report.txt`: draft auxiliary MPC-style text for review only;
-- `*_candidates.png`: visual cutouts for top candidates;
-- `*_pipeline.log`: audit log for the run.
+Lia has two main astrometric modes.
 
-Official campaign submission should still follow the normal Astrometrica/IASC process. Use Lia to decide where to look first, then inspect and measure candidates manually.
+### `--wcs-mode gaia`
 
-## Understanding The Score
+Default mode. Lia reconstructs the initial WCS from the FITS header and attempts to refine the astrometric solution using Gaia DR3 reference stars.
 
-The score is a transparent ranking heuristic from 0 to 12:
-
-| Score | Class | Meaning |
-|---:|---|---|
-| 8-12 | `STRONG` | inspect first |
-| 6-7 | `MODERATE` | plausible candidate |
-| 4-5 | `WEAK` | low-priority candidate |
-| 0-3 | `DISCARDED` | likely artifact or rejected source |
-
-The score combines linear motion, frame-to-frame velocity consistency, flux stability, point-source morphology, elongation, and expected motion range for short IASC sequences. It is not a calibrated confidence value.
-
-## Exporting Validation Metrics
-
-After running several image sets, export CSV files for validation:
+This mode is recommended for operational use before inspection in Astrometrica.
 
 ```bash
-venv/bin/python tools/export_metrics.py results/ --out validation_metrics --recursive
+venv/bin/python src/detector.py --images images/XY14_p10 --output results/XY14_p10_gaia --wcs-mode gaia
 ```
 
-This creates:
+### `--wcs-mode header`
 
-- `validation_metrics_sets.csv`: one row per processed set;
-- `validation_metrics_candidates.csv`: one row per candidate.
+Internal comparison mode. Lia uses only the WCS reconstructed from the FITS header, without Gaia DR3 refinement.
 
-The CSV includes empty manual-review columns such as `measured_in_astrometrica`, `included_in_astrometrica_mpc`, `iasc_feedback`, `manual_classification`, and `notes`.
+Everything else in the pipeline remains identical: background estimation, detection, PSF fitting, tracking, scoring, filters, and output generation.
 
-## More Documentation
-
-For the full scientific and technical explanation, read:
-
-- [English methodology](docs/methodology.md)
-- [Metodologia em Portugues do Brasil](docs/methodology.pt-BR.md)
-
-Those documents explain FITS timing, background estimation, PSF fitting, Gaia DR3 refinement, header-only WCS mode, SkyBot checks, scoring, validation, limitations, and why human review remains necessary.
-
-## Project Structure
-
-```text
-lia-astrometry/
-├── README.md
-├── README.pt-BR.md
-├── docs/
-│   ├── methodology.md
-│   └── methodology.pt-BR.md
-├── src/
-│   └── detector.py
-├── tests/
-│   └── test_basic.py
-├── tools/
-│   └── export_metrics.py
-├── requirements.txt
-└── pytest.ini
+```bash
+venv/bin/python src/detector.py --images images/XY14_p10 --output results/XY14_p10_header --wcs-mode header
 ```
 
-## References
-
-- [NASA Science: International Astronomical Search Collaboration](https://science.nasa.gov/citizen-science/international-astronomical-search-collaboration/)
-- [IASC official website](https://iasc.cosmosearch.org/)
-- [IASC campaign registration](https://iasc.cosmosearch.org/Home/Registration)
-- Gaia Collaboration et al. (2023), *Gaia Data Release 3*, Astronomy & Astrophysics, 674, A1.
-- Stetson, P. B. (1987), *DAOPHOT: A Computer Program for Crowded-Field Stellar Photometry*, PASP, 99, 191.
-- Astropy Collaboration et al. (2022), *The Astropy Project*.
-- IMCCE SkyBot documentation, used through `astroquery.imcce.Skybot`.
-- Minor Planet Center astrometry and observation-format documentation.
-
-## License
-
-MIT License. See [LICENSE](LICENSE).
